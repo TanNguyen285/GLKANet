@@ -1,0 +1,54 @@
+# ============================================================
+# Simple_GLKA — model config (YOLOv8-style)
+# ============================================================
+# Quy ước cột:
+#   [from, repeats, block, args]
+#
+#   from    : index layer đầu vào (-1 = layer trước đó)
+#   repeats : số lần lặp block (hiện tại luôn 1)
+#   block   : tên class trong BLOCK_REGISTRY
+#   args    : list tham số truyền thẳng vào __init__
+#             (không kể in_channels — builder tự điền từ output layer trước)
+#
+# EfficientBlock args: [out_channels, stride, expansion_ratio, use_glka, glka_K, se_reduction]
+# ConvBnRelu    args: [out_channels, kernel_size, stride, padding, groups, activation]
+# ============================================================
+
+# ── Meta ──────────────────────────────────────────────────────
+nc: 2          # number of classes
+input_size: 224
+
+# ── Model info ────────────────────────────────────────────────
+model_name: simple_glka
+
+# ── Backbone ──────────────────────────────────────────────────
+# input: [B, 3, 224, 224]
+backbone:
+  # [from, repeats, block, args]
+  # Stem: 3 → 32, stride 2 → 112×112
+  - [-1, 1, ConvBnRelu,     [32, 3, 2, 1, 1, true]]
+
+  # Block 0: 32→32  stride1  no GLKA
+  - [-1, 1, EfficientBlock, [32,  1, 2, false, 13, 8]]
+
+  # Block 1: 32→64  stride2  GLKA  → 56×56
+  - [-1, 1, EfficientBlock, [64,  2, 2, true,  13, 8]]
+
+  # Block 2: 64→64  stride1  GLKA
+  - [-1, 1, EfficientBlock, [64,  1, 2, true,  13, 8]]
+
+  # Block 3: 64→128 stride2  GLKA  → 28×28
+  - [-1, 1, EfficientBlock, [128, 2, 2, true,  13, 8]]
+
+  # Block 4: 128→128 stride1 no GLKA
+  - [-1, 1, EfficientBlock, [128, 1, 2, false, 13, 8]]
+
+  # Block 5: 128→256 stride2 no GLKA → 14×14
+  - [-1, 1, EfficientBlock, [256, 2, 2, false, 13, 8]]
+
+# ── Head (Classifier) ─────────────────────────────────────────
+# GlobalAvgPool + Dropout + Linear — builder xử lý riêng
+head:
+  pool:    AdaptiveAvgPool2d   # fixed
+  dropout: 0.1
+  # Linear: 256 → nc  (builder tự điền in_features từ backbone output)

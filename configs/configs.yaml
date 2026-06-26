@@ -1,0 +1,73 @@
+# ============================================================
+# configs/ccmt.yaml — Training config cho CCMT Augmented
+# Dùng: python train.py --cfg configs/ccmt.yaml
+# ============================================================
+
+# ── Model ────────────────────────────────────────────────────
+model_yaml: simple_glka.yaml    # đường dẫn tương đối so với configs/ccmt.yaml
+                                # builder tự đọc nc từ dataset (override yaml)
+
+# ── Dataset ──────────────────────────────────────────────────
+data:
+  root:       "C:/Users/ThisPC/Desktop/CCMT Dataset-Augmented"
+  val_ratio:  0.1               # 10% từ train_set → val (stratified)
+  seed:       42
+  handle_imbalance: false
+
+  # Augmentation (train)
+  img_size:   224
+  crop_scale: [0.7, 1.0]
+  flip_h:     0.5
+  flip_v:     0.3
+  color_jitter:
+    brightness: 0.3
+    contrast:   0.3
+    saturation: 0.2
+    hue:        0.05
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+
+# ── Training ─────────────────────────────────────────────────
+train:
+  epochs:     100
+  batch_size: 64
+  seed:       42
+
+  optimizer:
+    type:         SGD           # SGD | AdamW
+    lr:           0.01
+    momentum:     0.9
+    weight_decay: 0.0005
+    nesterov:     true
+    # AdamW params (dùng khi type: AdamW)
+    # lr:           0.0003
+    # weight_decay: 0.01
+
+  scheduler:
+    type:    CosineAnnealingLR  # CosineAnnealingLR | StepLR
+    eta_min: 0.000001
+    # StepLR params (dùng khi type: StepLR)
+    # step_size: 10
+    # gamma:     0.1
+
+  # Loss
+  label_smoothing: 0.0          # 0.0 = tắt
+
+# ── Hardware ─────────────────────────────────────────────────
+hardware:
+  device:      auto             # auto | cuda | cpu
+  num_workers: 4                # Windows gặp lỗi → đổi thành 0
+  pin_memory:  true
+
+# ── Logging / Output ─────────────────────────────────────────
+logging:
+  runs_dir:        runs_ccmt    # tương đối so với thư mục chạy train.py
+  tsne_interval:   20           # sinh t-SNE mỗi N epoch (0 = tắt)
+  gradcam_interval: 20           # 0 = tắt
+  eval_test:       true         # đánh giá test_set sau train xong
+
+# ── Export ───────────────────────────────────────────────────
+export:
+  enabled:    true              # export 3 bản sau train
+  opset:      18
