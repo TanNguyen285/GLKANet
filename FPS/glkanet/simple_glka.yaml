@@ -1,0 +1,13 @@
+nc: 22
+backbone:
+  - [-1, 1, ConvBnRelu,     [32, 3, 2, 1, 1, true]]
+  - [-1, 1, EfficientBlock, [32,  1, 2, true,   3, 0]]
+  - [-1, 1, EfficientBlock, [64,  2, 2, true,   5, 0]]
+  - [-1, 1, EfficientBlock, [64,  1, 2, true,   7, 0]]
+  - [-1, 1, EfficientBlock, [128, 2, 2, true,  7, 0]]
+  - [-1, 1, EfficientBlock, [128, 1, 2, true,  5, 8]]
+  - [-1, 1, EfficientBlock, [256, 2, 2, true,  3, 4]]
+
+head:
+  pool: AdaptiveAvgPool2d
+  dropout: 0.3

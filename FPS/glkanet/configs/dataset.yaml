@@ -1,0 +1,8 @@
+# ============================================================
+# configs/dataset.yaml — Data config (YOLO-style)
+# Đổi dataset: chỉ sửa file này, không đụng train.yaml
+# ============================================================
+
+# Root dataset (absolute path)
+path: C:\Users\ThisPC\Desktop\Dataset for Crop Pest and Disease Detection\Dataset for Crop Pest and Disease Detection\Raw Data\CCMT Dataset
+

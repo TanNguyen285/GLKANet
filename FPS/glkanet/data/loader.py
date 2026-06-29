@@ -263,28 +263,17 @@ def _apply_split_strategy(
 class ImageDataset(Dataset):
     """
     Tối ưu so với bản gốc:
-    - Không print() trong __getitem__ → tránh log spam (Windows console I/O chậm).
-    - Image.draft() decode nhanh hơn cho JPEG khi ảnh gốc lớn hơn target nhiều.
-    - QUAN TRỌNG: resize ảnh về kích thước cố định TRƯỚC khi đưa vào augment.
-      → augment (RandomResizedCrop, ColorJitter, flip...) chạy trên ảnh đã nhỏ,
-        không phải decode/xử lý trên ảnh gốc to → giảm tải CPU đáng kể, đặc biệt
-        khi ảnh gốc trong dataset không đồng nhất kích thước.
+    - Không print() trong __getitem__ → log spam là nguyên nhân chậm rất lớn
+      khi có nhiều ảnh lỗi/corrupt, đặc biệt trên Windows (console I/O chậm).
+      Thay vào đó: đếm số lỗi nội bộ, in tổng kết 1 lần sau khi train xong epoch đầu.
+    - Dùng Image.draft() cho ảnh JPEG để decode nhanh hơn khi ảnh gốc lớn hơn
+      target size nhiều (không ảnh hưởng nếu ảnh đã sẵn 400x400, nhưng an toàn).
     """
 
-    def __init__(
-        self,
-        samples:     Samples,
-        transform=None,
-        target_size: int = 224,
-        pre_resize:  int = 0,
-    ):
+    def __init__(self, samples: Samples, transform=None, target_size: int = 224):
         self.samples     = samples
         self.transform   = transform
         self.target_size = target_size
-        # pre_resize: cạnh ngắn được resize về trước khi augment. 0 → tự tính
-        # = target_size * 1.15 (đủ dư để RandomResizedCrop crop ngẫu nhiên mà
-        # không bị crop tới mép ảnh, nhưng không quá to gây tốn CPU vô ích).
-        self.pre_resize  = pre_resize or int(round(target_size * 1.15))
         self._err_count  = 0
 
     def __len__(self) -> int:
@@ -293,31 +282,13 @@ class ImageDataset(Dataset):
     def _load(self, path: str) -> Optional[Image.Image]:
         try:
             img = Image.open(path)
-            # draft(): chỉ JPEG, giúp decoder bỏ qua phần lớn dữ liệu không
-            # cần thiết khi ảnh gốc to hơn nhiều so với pre_resize.
+            # draft() chỉ áp dụng cho JPEG, giúp decoder bỏ qua phần lớn dữ liệu
+            # không cần thiết khi ảnh gốc to hơn nhiều so với target_size.
             try:
-                img.draft("RGB", (self.pre_resize, self.pre_resize))
+                img.draft("RGB", (self.target_size, self.target_size))
             except Exception:
                 pass
-            img = img.convert("RGB")
-
-            # ── Resize về kích thước cố định TRƯỚC khi augment ──────────
-            # Dùng BILINEAR (rẻ) thay vì để augment tự lo decode + crop
-            # trên ảnh gốc kích thước bất kỳ.
-            w, h = img.size
-            if w != h:
-                # giữ tỉ lệ, resize theo cạnh ngắn rồi center-crop về vuông
-                # để augment sau đó luôn nhận input đồng nhất kích thước
-                scale = self.pre_resize / min(w, h)
-                nw, nh = int(round(w * scale)), int(round(h * scale))
-                img = img.resize((nw, nh), Image.BILINEAR)
-                left = (nw - self.pre_resize) // 2
-                top  = (nh - self.pre_resize) // 2
-                img = img.crop((left, top, left + self.pre_resize, top + self.pre_resize))
-            elif w != self.pre_resize:
-                img = img.resize((self.pre_resize, self.pre_resize), Image.BILINEAR)
-
-            return img
+            return img.convert("RGB")
         except Exception:
             self._err_count += 1
             return None
@@ -339,11 +310,6 @@ class ImageDataset(Dataset):
 
 
 def build_train_transform(train_cfg: dict) -> transforms.Compose:
-    """
-    LƯU Ý: ảnh đưa vào đây đã được ImageDataset resize về kích thước cố định
-    (pre_resize) từ trước, nên RandomResizedCrop ở đây chỉ làm việc crop +
-    resize trên ảnh nhỏ — không phải decode lại ảnh gốc to.
-    """
     aug      = train_cfg.get("augment", {})
     norm     = train_cfg.get("normalize", {})
     img_size = train_cfg.get("img_size", 224)
@@ -364,10 +330,6 @@ def build_train_transform(train_cfg: dict) -> transforms.Compose:
 
 
 def build_val_transform(train_cfg: dict) -> transforms.Compose:
-    """
-    Ảnh đã được resize sẵn về đúng kích thước gần target trong ImageDataset,
-    ở đây chỉ cần Resize "chốt" về đúng img_size (rẻ, vì input đã nhỏ).
-    """
     norm     = train_cfg.get("normalize", {})
     img_size = train_cfg.get("img_size", 224)
     mean     = norm.get("mean", [0.485, 0.456, 0.406])
@@ -424,19 +386,10 @@ def get_data_loaders(
     seed        = train_cfg.get("seed",       42)
     imbalance   = train_cfg.get("handle_imbalance", False)
     img_size    = train_cfg.get("img_size", 224)
-
-    # ── HW config: train và eval (val/test) dùng config RIÊNG ──────────
-    # Train cần nhiều worker + prefetch để giữ GPU no đủ dữ liệu, vì
-    # persistent_workers=True nên các worker này sống suốt training.
-    # Val/test chỉ chạy 1 lượt mỗi epoch (ngắn) → không cần nhiều worker,
-    # và tuyệt đối không nên persistent_workers vì sẽ cộng dồn worker
-    # process + prefetch buffer của train + val + test cùng lúc → tràn RAM
-    # (đây chính là nguyên nhân lỗi "DefaultCPUAllocator: not enough memory").
-    num_workers_train = hw_cfg.get("num_workers", 8)
-    num_workers_eval  = hw_cfg.get("num_workers_eval", min(2, num_workers_train))
-    pin_memory        = hw_cfg.get("pin_memory", True)
-    prefetch_train    = hw_cfg.get("prefetch_factor", 2) if num_workers_train > 0 else None
-    prefetch_eval     = 2 if num_workers_eval > 0 else None
+    num_workers = hw_cfg.get("num_workers", 8)
+    pin_memory  = hw_cfg.get("pin_memory",  True)
+    # prefetch_factor chỉ hợp lệ khi num_workers > 0
+    prefetch    = hw_cfg.get("prefetch_factor", 4) if num_workers > 0 else None
 
     struct = _detect_structure(dcfg.train_dir)
 
@@ -517,7 +470,7 @@ def get_data_loaders(
     val_tf   = build_val_transform(train_cfg)
 
     train_ds = ImageDataset(train_s, train_tf, target_size=img_size)
-    val_ds   = ImageDataset(val_s,   val_tf,   target_size=img_size) if val_s else None
+    val_ds   = ImageDataset(val_s,   val_tf,   target_size=img_size)
     test_ds  = ImageDataset(test_s,  val_tf,   target_size=img_size) if test_s else None
 
     sampler = None
@@ -530,36 +483,26 @@ def get_data_loaders(
             sampler = WeightedRandomSampler(w, len(train_ds), replacement=True)
             print(f"  [sampler] imbalance={ratio:.1f}× → WeightedRandomSampler ON")
 
-    # ── DataLoader kwargs — TÁCH RIÊNG train / eval ─────────────────────
-    train_kw = dict(
-        num_workers=num_workers_train,
+    # ── DataLoader kwargs — tối ưu cho Windows + ảnh nhỏ (400x400) ──
+    kw = dict(
+        num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=(num_workers_train > 0),
+        persistent_workers=(num_workers > 0),
     )
-    if prefetch_train is not None:
-        train_kw["prefetch_factor"] = prefetch_train
-
-    eval_kw = dict(
-        num_workers=num_workers_eval,
-        pin_memory=pin_memory,
-        persistent_workers=False,   # KHÔNG giữ worker sống giữa các epoch
-    )
-    if prefetch_eval is not None:
-        eval_kw["prefetch_factor"] = prefetch_eval
+    if prefetch is not None:
+        kw["prefetch_factor"] = prefetch
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,
         sampler=sampler, shuffle=(sampler is None),
-        drop_last=True, **train_kw,
+        drop_last=True, **kw,
     )
-    val_loader = (
-        DataLoader(val_ds, batch_size=batch_size * 2, shuffle=False, **eval_kw)
-        if val_ds else None
-    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size * 2, shuffle=False, **kw)
     test_loader = (
-        DataLoader(test_ds, batch_size=batch_size * 2, shuffle=False, **eval_kw)
+        DataLoader(test_ds, batch_size=batch_size * 2, shuffle=False, **kw)
         if test_ds else None
     )
 
-    _print_summary(dcfg, class_names, train_s, val_s or [], test_s, strategy)
+    _print_summary(dcfg, class_names, train_s, val_s, test_s, strategy)
     return train_loader, val_loader, test_loader, class_names
