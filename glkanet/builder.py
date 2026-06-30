@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from glkanet.blocks import BLOCK_REGISTRY, ConvBnRelu, EfficientBlock
+    from glkanet.blocks import BLOCK_REGISTRY, ConvBnRelu, EfficientBlock, ShuffleGLKABlock
     from glkanet.blocks import GLKA as _GLKABlock
 except ImportError:
-    from blocks import BLOCK_REGISTRY, ConvBnRelu, EfficientBlock
+    from blocks import BLOCK_REGISTRY, ConvBnRelu, EfficientBlock, ShuffleGLKABlock
     from blocks import GLKA as _GLKABlock
 
 
@@ -21,17 +21,59 @@ except ImportError:
 # ──────────────────────────────────────────────────────────────
 
 class ClassifierHead(nn.Module):
-    def __init__(self, in_features: int, num_classes: int, dropout: float = 0.1):
+    """
+    GAP → Flatten → [BN1d] → [Linear(in→mid) + BN1d + Hardswish] → Dropout → Linear(→nc)
+
+    Args:
+        in_features:  số channels từ backbone (sau GAP+Flatten)
+        num_classes:  số class đầu ra
+        dropout:      tỉ lệ dropout trước FC cuối (default 0.2)
+        mid_features: nếu > 0, thêm bottleneck Linear(in→mid) trước FC chính
+                      giúp học feature tốt hơn khi backbone out lớn (vd 512→256→nc)
+                      nếu = 0, tắt bottleneck
+        use_bn:       thêm BN1d ngay sau Flatten (trước bottleneck hoặc Dropout)
+                      giúp normalize features sau GAP, thường tăng ~0.5–1% acc
+    """
+    def __init__(
+        self,
+        in_features:  int,
+        num_classes:  int,
+        dropout:      float = 0.2,
+        mid_features: int   = 0,
+        use_bn:       bool  = False,
+    ):
         super().__init__()
         self.pool    = nn.AdaptiveAvgPool2d(1)
         self.flatten = nn.Flatten()
-        self.drop    = nn.Dropout(p=dropout)
-        self.fc      = nn.Linear(in_features, num_classes)
+
+        layers: list[nn.Module] = []
+
+        # BN1d ngay sau Flatten (optional)
+        if use_bn:
+            layers.append(nn.BatchNorm1d(in_features))
+
+        if mid_features > 0:
+            # Bottleneck: in → mid → nc
+            layers += [
+                nn.Linear(in_features, mid_features, bias=False),
+                nn.BatchNorm1d(mid_features),
+                nn.Hardswish(inplace=True),
+                nn.Dropout(p=dropout),
+                nn.Linear(mid_features, num_classes),
+            ]
+        else:
+            # Bare: in → nc
+            layers += [
+                nn.Dropout(p=dropout),
+                nn.Linear(in_features, num_classes),
+            ]
+
+        self.classifier = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor):
         x        = self.pool(x)
         features = self.flatten(x)
-        logits   = self.fc(self.drop(features))
+        logits   = self.classifier(features)
         return logits, features
 
 
@@ -82,7 +124,7 @@ class GLKANet(nn.Module):
 # ──────────────────────────────────────────────────────────────
 
 def _out_channels_of(block: nn.Module, in_ch: int, args: list) -> int:
-    if isinstance(block, (ConvBnRelu, EfficientBlock)):
+    if isinstance(block, (ConvBnRelu, EfficientBlock, ShuffleGLKABlock)):
         return args[0]
     with torch.no_grad():
         dummy = torch.zeros(1, in_ch, 32, 32)
@@ -112,9 +154,18 @@ def _build_block(block_name: str, in_channels: int, args: list[Any]) -> nn.Modul
 def build_from_yaml(yaml_path: str | Path, in_channels: int = 3) -> GLKANet:
     cfg = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
 
-    num_classes: int   = cfg["nc"]
-    dropout:     float = cfg.get("head", {}).get("dropout", 0.1)
+    num_classes: int = cfg["nc"]
 
+    # ── Parse head config ──────────────────────────────────────
+    head_cfg = cfg.get("head", {})
+    if not isinstance(head_cfg, dict):   # guard: YAML cũ dùng head là list
+        head_cfg = {}
+
+    dropout      = float(head_cfg.get("dropout",      0.2))
+    mid_features = int(head_cfg.get("mid_features",   0))
+    use_bn       = bool(head_cfg.get("use_bn",        False))
+
+    # ── Build backbone ─────────────────────────────────────────
     backbone_layers: list[nn.Module] = []
     layer_channels:  list[int]       = []
     outputs_ch = [in_channels]
@@ -131,11 +182,15 @@ def build_from_yaml(yaml_path: str | Path, in_channels: int = 3) -> GLKANet:
             outputs_ch.append(out_ch)
             in_ch = out_ch
 
+    # ── Build head ─────────────────────────────────────────────
     head = ClassifierHead(
-        in_features=layer_channels[-1],
-        num_classes=num_classes,
-        dropout=dropout,
+        in_features  = layer_channels[-1],
+        num_classes  = num_classes,
+        dropout      = dropout,
+        mid_features = mid_features,
+        use_bn       = use_bn,
     )
+
     return GLKANet(
         backbone_layers=nn.ModuleList(backbone_layers),
         head=head,

@@ -13,8 +13,8 @@ import torch.nn as nn
 def export_all(
     model:      nn.Module,
     save_dir:   Path,
+    yaml_path:  str | Path,
     input_size: int  = 224,
-    yaml_path:  str | Path | None = None,
     opset:      int  = 18,
     verbose:    bool = True,
 ) -> dict[str, Path]:
@@ -23,14 +23,18 @@ def export_all(
     Args:
         model:      GLKANet ở eval mode
         save_dir:   thư mục exp (weights/ sẽ tạo bên trong)
+        yaml_path:  path file yaml kiến trúc — bắt buộc, tự copy vào weights/
         input_size: chiều ảnh vuông
-        yaml_path:  nếu có → copy kèm vào weights/
         opset:      ONNX opset (>= 18)
         verbose:    in log
 
     Returns:
-        {"train": Path, "deploy": Path, "onnx": Path}
+        {"train": Path, "deploy": Path, "onnx": Path, "yaml": Path}
     """
+    yaml_path = Path(yaml_path)
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"yaml_path không tồn tại: {yaml_path}")
+
     weights_dir = Path(save_dir) / "weights"
     weights_dir.mkdir(parents=True, exist_ok=True)
 
@@ -53,7 +57,6 @@ def export_all(
         print(f"  [export] deploy  → {path_deploy.name}")
 
     # ── 3. ONNX ──────────────────────────────────────────────
-    # ── 3. ONNX ──────────────────────────────────────────────
     path_onnx = weights_dir / "best_deploy.onnx"
 
     class _Wrapper(nn.Module):
@@ -61,46 +64,49 @@ def export_all(
         def __init__(self, m): super().__init__(); self.m = m
         def forward(self, x): return self.m(x)[0]
 
-    wrapper = _Wrapper(model_deploy)
+    wrapper = _Wrapper(model_deploy).cpu()
     wrapper.eval()
-    dummy   = torch.zeros(1, 3, input_size, input_size)
+    dummy = torch.zeros(1, 3, input_size, input_size)
 
-    # Đổi từ dạng torch.export.Dim sang định dạng dynamic_axes chuẩn của torch.onnx.export
     dynamic_axes = {
         "images": {0: "batch"},
-        "logits": {0: "batch"}
+        "logits": {0: "batch"},
     }
 
     torch.onnx.export(
-        wrapper, 
-        dummy, 
+        wrapper,
+        dummy,
         str(path_onnx),
         opset_version=max(opset, 18),
         input_names=["images"],
         output_names=["logits"],
-        dynamic_axes=dynamic_axes,  # Đổi từ dynamic_shapes sang dynamic_axes
+        dynamic_axes=dynamic_axes,
     )
     if verbose:
         print(f"  [export] onnx    → {path_onnx.name}")
 
-    # ── 4. Copy yaml nếu có ──────────────────────────────────
-    if yaml_path is not None:
-        dst = weights_dir / Path(yaml_path).name
-        shutil.copy2(yaml_path, dst)
-        if verbose:
-            print(f"  [export] yaml    → {dst.name}")
+    # ── 4. Copy yaml kiến trúc (bắt buộc) ────────────────────
+    path_yaml = weights_dir / yaml_path.name
+    shutil.copy2(yaml_path, path_yaml)
+    if verbose:
+        print(f"  [export] yaml    → {path_yaml.name}")
 
     if verbose:
-        _print_sizes(path_train, path_deploy, path_onnx)
+        _print_sizes(path_train, path_deploy, path_onnx, path_yaml)
 
-    return {"train": path_train, "deploy": path_deploy, "onnx": path_onnx}
+    return {
+        "train":  path_train,
+        "deploy": path_deploy,
+        "onnx":   path_onnx,
+        "yaml":   path_yaml,
+    }
 
 
 def _print_sizes(*paths: Path) -> None:
     print("\n  [export] File sizes:")
     for p in paths:
         if p.exists():
-            print(f"           {p.name:<25} {p.stat().st_size/1024/1024:.2f} MB")
+            print(f"           {p.name:<25} {p.stat().st_size / 1024 / 1024:.2f} MB")
 
 
 def load_checkpoint(
@@ -120,8 +126,9 @@ def load_checkpoint(
 
     ckpt  = torch.load(pt_path, map_location=device, weights_only=True)
     model = build_from_yaml(yaml_path)
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
     if ckpt.get("deployed", False):
         model.switch_to_deploy()
+
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
     return model.to(device)

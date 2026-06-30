@@ -1,0 +1,33 @@
+nc: 22
+
+# ──────────────────────────────────────────────────────────────
+# Layer params (in list order):
+#
+# ConvBnRelu:
+#   [out_channels, kernel_size, stride, padding, groups, bias]
+#
+# ShuffleGLKABlock:
+#   [out_channels, split_ratio, stride, use_glka, glka_K, se_reduction]
+#     - out_channels  : number of output channels for this block
+#     - split_ratio   : fraction of channels routed through the proc
+#                       (processing) branch; the rest (1 - split_ratio)
+#                       goes through the identity branch
+#     - stride        : 1 = basic unit (requires in == out, does split+shuffle)
+#                       2 = downsample unit (in can differ from out,
+#                           input is NOT split, both branches read full input)
+#     - use_glka      : true  = proc branch uses GLKA (multi dilated conv)
+#                       false = proc branch uses a plain DWConv3x3
+#     - glka_K        : effective kernel size of GLKA (preset 3/5/7/13),
+#                       ignored if use_glka=false
+#     - se_reduction  : channel reduction ratio for the SE gate inside GLKA,
+#                       0 = SE disabled, ignored if use_glka=false
+# ──────────────────────────────────────────────────────────────
+
+backbone:
+  - [-1, 1, ConvBnRelu,        [32, 3, 2, 1, 1, false]]
+  - [-1, 1, ShuffleGLKABlock,  [32,  2, 0.5, false,  3, 0]]
+  - [-1, 1, ShuffleGLKABlock,  [64,  2, 0.5, true,   5, 0]]
+  - [-1, 1, ShuffleGLKABlock,  [64,  2, 0.5, true,   7, 0]]
+  - [-1, 1, ShuffleGLKABlock,  [128, 2, 0.5, true,  13, 16]]
+  - [-1, 1, ShuffleGLKABlock,  [128, 2, 0.5, false,  3, 8]]
+  - [-1, 1, ShuffleGLKABlock,  [256, 2, 0.5, false,  3, 4]]

@@ -8,6 +8,48 @@ except ImportError:
     from .conv_blocks import conv_bn_relu
     from .glka_block  import GLKA
 
+# ──────────────────────────────────────────────────────────────
+# EfficientBlock — Tree cấu trúc
+# ──────────────────────────────────────────────────────────────
+#
+# EfficientBlock(in_channels, out_channels, stride)
+# │
+# ├── shortcut (nhánh residual, chỉ active khi stride==1)
+# │     ├── stride==1 & in==out  → nn.Identity()
+# │     └── stride==1 & in!=out  → Conv1x1(in→out) + BN
+# │     (stride==2 → không có shortcut, use_residual=False)
+# │
+# └── main path: x → expand → dw/glka → project → (+identity nếu residual)
+#       │
+#       ├── expand: Conv1x1(in_channels → hidden_dim) + BN + ReLU6
+#       │     hidden_dim = in_channels * expansion_ratio
+#       │
+#       ├── dw / glka (rẽ nhánh theo use_glka, chỉ 1 trong 2 active)
+#       │     │
+#       │     ├── use_glka=True:
+#       │     │     ├── dw   = nn.Identity()  (bỏ qua, GLKA tự lo stride)
+#       │     │     └── glka = GLKA(dim=hidden_dim, K=glka_K, stride=stride,
+#       │     │                     se_reduction=se_reduction)
+#       │     │           │
+#       │     │           ├── conv0: DW 5x5 (stride tại đây) + BN + ReLU6
+#       │     │           ├── branches: multi dilated DWConv theo K-preset, sum lại
+#       │     │           ├── SE gate (nếu se_reduction>0) hoặc Identity
+#       │     │           └── output = anchor * (branch_out * gate)
+#       │     │
+#       │     └── use_glka=False:
+#       │           ├── dw   = DWConv3x3(hidden_dim, stride=stride) + BN + ReLU6
+#       │           └── glka = nn.Identity()
+#       │
+#       └── project: Conv1x1(hidden_dim → out_channels) + BN  (không activation)
+#
+# Forward:
+#   identity = shortcut(x)
+#   out = expand(x) → dw(out) → glka(out) → project(out)
+#   return identity + out   if use_residual (stride==1)
+#   return out              if stride==2
+#
+# ──────────────────────────────────────────────────────────────
+
 
 class EfficientBlock(nn.Module):
 

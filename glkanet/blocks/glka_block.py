@@ -90,7 +90,7 @@ class GLKA(nn.Module):
         # SE chạy sau sum → channel gate
         gate = self.se(branch_out)          # Sigmoid hoặc Identity
 
-        return anchor * (branch_out * gate)
+        return anchor * gate
     # ── Structural reparameterization ─────────────────────────────────
     def switch_to_deploy(self) -> None:
         if not hasattr(self, "branches"):

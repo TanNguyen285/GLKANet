@@ -11,7 +11,7 @@ Dùng như YOLO:
     model.val("configs/ccmt.yaml")
 
     # Export
-    model.export(save_dir="runs/exp1")
+    model.export()
 
     # Load từ checkpoint
     model = GLKA.from_checkpoint("runs/exp1/weights/best_train.pt",
@@ -45,13 +45,11 @@ def _load_cfg(cfg_path: str | Path, overrides: dict | None = None) -> dict:
         for k, v in overrides.items():
             if v is None:
                 continue
-            # dotted key: "train.epochs" → cfg["train"]["epochs"]
             keys = k.split(".")
             d = cfg
             for key in keys[:-1]:
                 d = d.setdefault(key, {})
             d[keys[-1]] = v
-    # Resolve device auto
     hw = cfg.setdefault("hardware", {})
     if hw.get("device", "auto") == "auto":
         hw["device"] = "cuda" if torch.cuda.is_available() else "cpu"
@@ -59,9 +57,8 @@ def _load_cfg(cfg_path: str | Path, overrides: dict | None = None) -> dict:
 
 
 def _resolve_model_yaml(cfg: dict, cfg_path: Path) -> Path:
-    """Resolve model_yaml tương đối so với file cfg."""
     rel = cfg.get("model_yaml", "simple_glka.yaml")
-    candidate = cfg_path.parent.parent / rel   # configs/../simple_glka.yaml
+    candidate = cfg_path.parent.parent / rel
     if candidate.exists():
         return candidate
     candidate2 = _PKG_DIR.parent / rel
@@ -91,13 +88,7 @@ class GLKA:
 
     # ── Build / load model ────────────────────────────────────
 
-    def _build(self, num_classes: int) -> nn.Module:
-        from glkanet.builder import build_from_yaml
-        return build_from_yaml(self.model_yaml, in_channels=3)
-        # num_classes sẽ được override qua patch yaml trong builder
-
     def _build_with_nc(self, num_classes: int) -> nn.Module:
-        """Build model với num_classes override."""
         import copy, tempfile, os
         cfg = yaml.safe_load(self.model_yaml.read_text())
         cfg["nc"] = num_classes
@@ -116,38 +107,21 @@ class GLKA:
 
     def train(
         self,
-        cfg:     str | Path,
+        cfg: str | Path,
         **overrides,
     ) -> dict:
-        """Huấn luyện model.
-
-        Args:
-            cfg:       đường dẫn tới train config yaml (vd: "configs/ccmt.yaml")
-            **overrides: override bất kỳ key nào trong yaml, dùng dấu chấm
-                         vd: epochs=50, batch_size=32,
-                             device="cpu", val_ratio=0.2
-
-        Returns:
-            {"best_f1": float, "best_loss": float, "save_dir": Path}
-
-        Ví dụ:
-            model = GLKA("simple_glka.yaml")
-            model.train("configs/ccmt.yaml", epochs=50, device="cpu")
-        """
         from glkanet.data import get_data_loaders
         from glkanet.trainer import Trainer, create_save_dir, set_seed
 
-        cfg_path = Path(cfg)
+        cfg_path  = Path(cfg)
         train_cfg = _load_cfg(cfg_path, _flatten_overrides(overrides))
         self._cfg = train_cfg
 
-        # Resolve model yaml
         if self.model_yaml is None:
             self.model_yaml = _resolve_model_yaml(train_cfg, cfg_path)
 
         set_seed(train_cfg["train"].get("seed", 42))
 
-        # Data
         data_yaml_path = _resolve_data_yaml(train_cfg, cfg_path)
         train_loader, val_loader, test_loader, class_names = get_data_loaders(
             data_yaml  = data_yaml_path,
@@ -157,17 +131,14 @@ class GLKA:
         )
         self._class_names = class_names
 
-        # Model
         self._model = self._build_with_nc(len(class_names))
         self._model.info()
 
-        # Save dir
         runs_dir = str(_ROOT / train_cfg.get("logging", {}).get("runs_dir", "runs"))
         self._save_dir = create_save_dir(runs_dir)
         print(f"[GLKA] device={train_cfg['hardware']['device']}  "
               f"save={self._save_dir}")
 
-        # Trainer
         trainer = Trainer(
             model       = self._model,
             cfg         = train_cfg,
@@ -189,26 +160,15 @@ class GLKA:
 
     def val(
         self,
-        cfg:      str | Path,
-        weights:  str | Path | None = None,
-        split:    str = "val",       # "val" | "test"
+        cfg:     str | Path,
+        weights: str | Path | None = None,
+        split:   str = "val",
         **overrides,
     ) -> tuple[float, float]:
-        """Đánh giá model trên val hoặc test set.
-
-        Args:
-            cfg:     train config yaml
-            weights: đường dẫn .pt  (None → dùng model hiện tại)
-            split:   "val" hoặc "test"
-
-        Returns:
-            (accuracy, f1_macro)
-        """
         from glkanet.data import get_data_loaders
         from glkanet.trainer import evaluate
         from glkanet.logger import save_report, plot_confusion_matrix
         from sklearn.metrics import accuracy_score, f1_score
-        import torch.nn as nn
 
         cfg_path  = Path(cfg)
         train_cfg = _load_cfg(cfg_path, _flatten_overrides(overrides))
@@ -223,7 +183,6 @@ class GLKA:
         )
         self._class_names = class_names
 
-        # Model
         if weights is not None:
             self.load(weights, cfg_path)
         elif self._model is None:
@@ -255,10 +214,11 @@ class GLKA:
     def export(
         self,
         save_dir:   str | Path | None = None,
-        input_size: int  = 224,
-        opset:      int  = 18,
+        input_size: int = 224,
+        opset:      int = 18,
     ) -> dict:
-        """Export 3 bản: best_train.pt / best_deploy.pt / best_deploy.onnx.
+        """Export 3 bản: best_train.pt / best_deploy.pt / best_deploy.onnx
+        + tự động copy yaml kiến trúc vào weights/.
 
         Args:
             save_dir:   thư mục lưu (mặc định = thư mục exp cuối)
@@ -266,12 +226,14 @@ class GLKA:
             opset:      ONNX opset version
 
         Returns:
-            {"train": Path, "deploy": Path, "onnx": Path}
+            {"train": Path, "deploy": Path, "onnx": Path, "yaml": Path}
         """
         from glkanet.exporter import export_all
 
         if self._model is None:
             raise RuntimeError("Chưa có model. Gọi .train() hoặc .load() trước.")
+        if self.model_yaml is None:
+            raise RuntimeError("Không có model_yaml. Khởi tạo GLKA('path/to/yaml') trước.")
 
         out = Path(save_dir) if save_dir else (self._save_dir or Path("runs/export"))
         out.mkdir(parents=True, exist_ok=True)
@@ -280,6 +242,7 @@ class GLKA:
         return export_all(
             model      = self._model,
             save_dir   = out,
+            yaml_path  = self.model_yaml,
             input_size = input_size,
             opset      = opset,
             verbose    = True,
@@ -290,19 +253,9 @@ class GLKA:
     @torch.no_grad()
     def predict(
         self,
-        images,                          # Tensor [B,3,H,W] hoặc đường dẫn ảnh
+        images,
         device: str = "cpu",
     ) -> tuple[list, list]:
-        """Inference trên batch ảnh.
-
-        Args:
-            images: torch.Tensor [B,3,H,W]  (đã normalize)
-                    hoặc list đường dẫn ảnh (tự load + resize)
-            device: "cpu" | "cuda"
-
-        Returns:
-            (class_indices, class_names)
-        """
         if self._model is None:
             raise RuntimeError("Chưa có model. Gọi .train() hoặc .load() trước.")
 
@@ -312,10 +265,10 @@ class GLKA:
         if not isinstance(images, torch.Tensor):
             images = _load_images(images, img_size=224)
 
-        images  = images.to(dev)
+        images    = images.to(dev)
         logits, _ = self._model(images)
-        indices = torch.argmax(logits, dim=1).cpu().tolist()
-        names   = (
+        indices   = torch.argmax(logits, dim=1).cpu().tolist()
+        names     = (
             [self._class_names[i] for i in indices]
             if self._class_names
             else indices
@@ -329,15 +282,6 @@ class GLKA:
         pt_path:  str | Path,
         cfg_path: str | Path | None = None,
     ) -> "GLKA":
-        """Load weights từ .pt checkpoint.
-
-        Args:
-            pt_path:  đường dẫn file .pt
-            cfg_path: train config yaml (cần nếu chưa build model)
-
-        Returns:
-            self (để chain)
-        """
         pt = Path(pt_path)
         if not pt.exists():
             raise FileNotFoundError(f"Checkpoint không tồn tại: {pt}")
@@ -350,9 +294,8 @@ class GLKA:
             if self.model_yaml is None:
                 raise RuntimeError(
                     "Cần truyền model_yaml vào GLKA() để load checkpoint.")
-            # Đoán num_classes từ state_dict
             sd = ckpt["state_dict"]
-            nc = sd["head.fc.weight"].shape[0]
+            nc = sd["head.classifier.4.weight"].shape[0]
             self._model = self._build_with_nc(nc)
 
         self._model.load_state_dict(ckpt["state_dict"])
@@ -373,14 +316,6 @@ class GLKA:
         pt_path:    str | Path,
         model_yaml: str | Path,
     ) -> "GLKA":
-        """Tạo GLKA từ checkpoint có sẵn.
-
-        Ví dụ:
-            model = GLKA.from_checkpoint(
-                "runs/exp1/weights/best_train.pt",
-                "simple_glka.yaml",
-            )
-        """
         obj = cls(model_yaml)
         obj.load(pt_path)
         return obj
@@ -405,13 +340,6 @@ class GLKA:
 # ──────────────────────────────────────────────────────────────
 
 def _resolve_data_yaml(cfg: dict, cfg_path: Path) -> Path:
-    """Resolve data yaml path.
-
-    Thứ tự tìm:
-      1. Absolute path → dùng thẳng
-      2. Relative so với cwd (project root) — vd: configs/dataset.yaml
-      3. Relative so với thư mục chứa train.yaml
-    """
     raw = cfg.get("data", None)
     if raw is None:
         raise ValueError(
@@ -422,11 +350,9 @@ def _resolve_data_yaml(cfg: dict, cfg_path: Path) -> Path:
     p = Path(raw)
     if p.is_absolute() and p.exists():
         return p
-    # Thử relative so với cwd (project root)
     from_cwd = Path.cwd() / p
     if from_cwd.exists():
         return from_cwd.resolve()
-    # Thử relative so với thư mục chứa train.yaml
     from_cfg = (cfg_path.parent / p).resolve()
     if from_cfg.exists():
         return from_cfg
@@ -439,15 +365,6 @@ def _resolve_data_yaml(cfg: dict, cfg_path: Path) -> Path:
 
 
 def _flatten_overrides(overrides: dict) -> dict:
-    """Map kwargs đơn giản → dotted keys cho _load_cfg.
-
-    train=50        → train.epochs=50  (không hỗ trợ)
-    epochs=50       → train.epochs=50
-    batch_size=32   → train.batch_size=32
-    lr=0.001        → train.optimizer.lr=0.001
-    device="cpu"    → hardware.device=cpu
-    val_ratio=0.2   → data.val_ratio=0.2
-    """
     mapping = {
         "epochs":     "train.epochs",
         "batch_size": "train.batch_size",
@@ -457,14 +374,10 @@ def _flatten_overrides(overrides: dict) -> dict:
         "workers":    "hardware.num_workers",
         "seed":       "train.seed",
     }
-    out = {}
-    for k, v in overrides.items():
-        out[mapping.get(k, k)] = v
-    return out
+    return {mapping.get(k, k): v for k, v in overrides.items()}
 
 
 def _load_images(paths: list, img_size: int = 224) -> torch.Tensor:
-    """Load list đường dẫn ảnh → Tensor [B,3,H,W] đã normalize."""
     from torchvision import transforms
     from PIL import Image
 
@@ -474,5 +387,4 @@ def _load_images(paths: list, img_size: int = 224) -> torch.Tensor:
         transforms.Normalize([0.485, 0.456, 0.406],
                              [0.229, 0.224, 0.225]),
     ])
-    tensors = [tf(Image.open(p).convert("RGB")) for p in paths]
-    return torch.stack(tensors)
+    return torch.stack([tf(Image.open(p).convert("RGB")) for p in paths])

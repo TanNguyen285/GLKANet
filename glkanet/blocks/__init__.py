@@ -4,6 +4,7 @@ from .conv_blocks     import ConvBnRelu, conv_bn_relu
 from .se_block        import SEBlock
 from .glka_block      import GLKA
 from .efficient_block import EfficientBlock
+from .shuffle_block import ShuffleGLKABlock
 
 # -----------------------------------------------------------------------
 # Registry: map tên string (từ yaml) → class
@@ -14,6 +15,7 @@ BLOCK_REGISTRY: dict = {
     "SEBlock":        SEBlock,
     "GLKA":           GLKA,
     "EfficientBlock": EfficientBlock,
+    "ShuffleGLKABlock":  ShuffleGLKABlock, 
 }
 
 __all__ = [
@@ -23,4 +25,5 @@ __all__ = [
     "GLKA",
     "EfficientBlock",
     "BLOCK_REGISTRY",
+    "ShuffleGLKABlock",
 ]

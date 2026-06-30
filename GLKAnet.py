@@ -2,7 +2,7 @@ from glkanet import GLKA
 
 def main():
     # 1. Khởi tạo mô hình dựa trên file kiến trúc ở thư mục gốc
-    model = GLKA("glkanet/simple_glka.yaml")
+    model = GLKA("glkanet/configs/shuffle_glkav2.yaml")
 
     print("--- Bắt đầu huấn luyện theo cấu hình từ YAML ---")
     
