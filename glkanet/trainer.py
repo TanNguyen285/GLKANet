@@ -12,12 +12,23 @@ TỐI ƯU so với bản gốc (không đổi logic train/eval/checkpoint):
   4. torch.backends.cudnn.benchmark = True khi không cần reproducibility
      tuyệt đối (vẫn giữ set_seed, chỉ tắt deterministic gây chậm cudnn).
   5. set_to_none=True khi zero_grad — nhanh hơn việc set về 0 toàn bộ tensor.
+  6. Resume training — checkpoint lưu cả optimizer/scheduler/scaler state,
+     không chỉ model weights, để tiếp tục train đúng từ chỗ dừng (LR,
+     momentum không bị reset về giá trị khởi tạo).
+  7. Copy yaml kiến trúc model ra weights/ NGAY LÚC BẮT ĐẦU TRAIN (không
+     đợi tới lúc export_all() ở cuối) — để nếu train bị dừng/crash giữa
+     chừng vẫn biết exp đó đang chạy kiến trúc nào, tiện khi test nhiều
+     cấu trúc model khác nhau.
+  8. export_all() được truyền thêm calib_loader/test_loader/export_tflite/
+     n_calib — để tự động export TFLite int8 và tự chạy so sánh accuracy
+     3 backend (PyTorch/ONNX/TFLite) ngay sau khi train xong.
 """
 
 from __future__ import annotations
 
 import random
 import platform
+import shutil
 from pathlib import Path
 from typing import List
 
@@ -165,18 +176,27 @@ class Trainer:
     """Quản lý toàn bộ train loop.
 
     Args:
-        model:       GLKANet
-        cfg:         dict parse từ ccmt.yaml (toàn bộ)
-        save_dir:    Path thư mục exp
-        class_names: list tên class từ dataloader
+        model:        GLKANet
+        cfg:          dict parse từ ccmt.yaml (toàn bộ)
+        save_dir:     Path thư mục exp
+        class_names:  list tên class từ dataloader
+        resume_ckpt:  path tới 1 checkpoint (.pt) đã lưu trước đó
+                      (best_f1.pt / best_loss.pt / bất kỳ file nào lưu
+                      bởi _save_ckpt) để load lại weights + optimizer +
+                      scheduler + scaler state và train tiếp từ đó.
+                      cfg["train"]["epochs"] là TỔNG số epoch mong muốn
+                      (không phải số epoch train thêm) — vd checkpoint
+                      đang ở epoch 80, muốn train thêm 120 epoch nữa thì
+                      set epochs: 200 trong yaml.
     """
 
     def __init__(
         self,
-        model:       nn.Module,
-        cfg:         dict,
-        save_dir:    Path,
-        class_names: List[str],
+        model:        nn.Module,
+        cfg:          dict,
+        save_dir:     Path,
+        class_names:  List[str],
+        resume_ckpt:  str | Path | None = None,
     ):
         self.model       = model
         self.cfg         = cfg
@@ -189,7 +209,13 @@ class Trainer:
         self.epochs   = tr_cfg["epochs"]
         self.log_cfg  = cfg.get("logging", {})
         self.exp_cfg  = cfg.get("export",  {})
+        self.tflite_project_dir = self.exp_cfg.get("tflite_project_dir", "TFlite")
+        self.test_dir           = self.exp_cfg.get("test_dir", None)
+    
 
+        norm_cfg = cfg.get("normalize", {})
+        self.norm_mean = tuple(norm_cfg.get("mean", [0.485, 0.456, 0.406]))
+        self.norm_std  = tuple(norm_cfg.get("std",  [0.229, 0.224, 0.225]))
         # AMP chỉ có ý nghĩa trên CUDA; tắt tự động nếu chạy CPU
         self.use_amp = hw_cfg.get("amp", True) and self.device.type == "cuda"
         self.scaler  = torch.amp.GradScaler('cuda', enabled=self.use_amp)
@@ -209,6 +235,18 @@ class Trainer:
         if self.use_channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
             print("  [trainer] channels_last bật — tối ưu depthwise/grouped conv (GLKA)")
+
+        self.hist       = dict(train_loss=[], val_loss=[], val_f1=[], val_acc=[])
+        self.best_f1    = 0.0
+        self.best_loss  = float("inf")
+        self.start_epoch = 0
+
+        # ── Resume ──────────────────────────────────────────────────
+        # PHẢI load state TRƯỚC torch.compile: compile wrap model lại
+        # (thêm prefix "_orig_mod." vào key state_dict), load checkpoint
+        # cũ (key không có prefix) sau compile sẽ lỗi mismatch.
+        if resume_ckpt is not None:
+            self._resume(resume_ckpt)
 
         # torch.compile fuse nhiều kernel nhỏ (depthwise conv, BN, branches
         # trong GLKA) thành ít kernel lớn hơn → giảm mạnh overhead launch.
@@ -231,12 +269,77 @@ class Trainer:
             reason = "Windows (Triton không hỗ trợ tốt)" if is_windows else "tắt qua config"
             print(f"  [trainer] torch.compile KHÔNG bật ({reason})")
 
-        self.hist      = dict(train_loss=[], val_loss=[], val_f1=[], val_acc=[])
-        self.best_f1   = 0.0
-        self.best_loss = float("inf")
-
         if self.use_amp:
             print("  [trainer] AMP (mixed precision) bật — fp16 trên CUDA")
+
+        if resume_ckpt is not None:
+            print(f"  [trainer] Resume: bắt đầu từ epoch {self.start_epoch + 1}/{self.epochs}")
+
+    # ── Resume helper ────────────────────────────────────────────
+    def _resume(self, ckpt_path: str | Path) -> None:
+        ckpt_path = Path(ckpt_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"resume_ckpt không tồn tại: {ckpt_path}")
+
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+
+        # model weights (bắt buộc phải có)
+        self.model.load_state_dict(ckpt["state_dict"])
+
+        # optimizer state (momentum SGD / moment AdamW) — nếu thiếu vẫn
+        # chạy được nhưng momentum sẽ reset, LR nhảy về giá trị khởi tạo
+        # cho tới khi scheduler catch up.
+        if "optimizer" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+        else:
+            print("  [trainer] ⚠ checkpoint không có optimizer state "
+                  "(checkpoint cũ trước khi có resume) — chỉ resume weights, "
+                  "momentum/LR sẽ khởi tạo lại từ đầu")
+
+        # scheduler state (vị trí hiện tại trên cosine curve)
+        if "scheduler" in ckpt:
+            self.scheduler.load_state_dict(ckpt["scheduler"])
+        else:
+            print("  [trainer] ⚠ checkpoint không có scheduler state — "
+                  "LR sẽ tính lại từ epoch 0 theo T_max mới")
+
+        # AMP grad scaler state
+        if "scaler" in ckpt and self.use_amp:
+            self.scaler.load_state_dict(ckpt["scaler"])
+
+        # epoch đã train xong -> tiếp tục từ epoch kế tiếp
+        self.start_epoch = ckpt.get("epoch", -1) + 1
+
+        # best metrics đã đạt được -> không bị ghi đè bởi giá trị tệ hơn
+        # ngay ở epoch đầu tiên sau resume
+        self.best_f1   = ckpt.get("best_f1",   ckpt.get("val_f1",   0.0))
+        self.best_loss = ckpt.get("best_loss", ckpt.get("val_loss", float("inf")))
+
+        if self.start_epoch >= self.epochs:
+            print(f"  [trainer] ⚠ checkpoint đã ở epoch {self.start_epoch}, "
+                  f">= epochs cấu hình ({self.epochs}). Tăng train.epochs "
+                  f"trong yaml nếu muốn train thêm.")
+
+    # ── Copy yaml kiến trúc helper ───────────────────────────────
+    def _copy_arch_yaml(self, model_yaml: str | Path | None) -> None:
+        """Copy file yaml kiến trúc model ra weights/ NGAY LÚC BẮT ĐẦU TRAIN."""
+        weights_dir = self.save_dir / "weights"
+        weights_dir.mkdir(parents=True, exist_ok=True)
+
+        if model_yaml is None:
+            print("  [trainer] ⚠ không truyền model_yaml vào run() — sẽ KHÔNG lưu được "
+                "yaml kiến trúc ngay từ đầu train.")
+            return
+
+        model_yaml = Path(model_yaml)
+        if not model_yaml.exists():
+            print(f"  [trainer] ⚠ model_yaml không tồn tại: {model_yaml} — bỏ qua copy yaml.")
+            return
+
+        dst = weights_dir / model_yaml.name
+        shutil.copy2(model_yaml, dst)
+        print(f"  [trainer] yaml kiến trúc → weights/{dst.name} "
+            f"(copy ngay lúc bắt đầu train, trước khi vào training loop)")
 
     # ── Run ───────────────────────────────────────────────────
     def run(
@@ -248,12 +351,29 @@ class Trainer:
         cfg_path:     str | Path | None = None,
         data_yaml:    str | Path | None = None,
     ) -> dict:
-        """Full train → val → test → export."""
+        """Full train → val → test → export.
+
+        Args:
+            train_loader, val_loader, test_loader: DataLoader tương ứng.
+            model_yaml:  (hiện chưa dùng riêng — xem cfg_path) đường dẫn
+                         yaml kiến trúc model, nếu bạn tách riêng khỏi
+                         cfg_path thì cần tự bổ sung logic dùng biến này.
+            cfg_path:    đường dẫn yaml kiến trúc model — được copy vào
+                         weights/ NGAY LÚC BẮT ĐẦU TRAIN (không đợi tới
+                         cuối), và cũng được dùng lại trong export_all()
+                         để đóng gói cùng checkpoint.
+            data_yaml:   (hiện chưa dùng riêng) đường dẫn yaml cấu hình
+                         dataset, nếu cần lưu lại thì tự bổ sung tương tự
+                         cfg_path.
+        """
         total_params = sum(p.numel() for p in self.model.parameters()) / 1e6
         write_train_header(
             self.save_dir, self.cfg,
             len(self.class_names), total_params, self.class_names,
         )
+
+        # ── Copy yaml kiến trúc NGAY TỪ ĐẦU, trước khi train ────────
+        self._copy_arch_yaml(model_yaml)
 
         tsne_interval = self.log_cfg.get("tsne_interval", 20)
         log_every = 10  # chỉ .item() loss mỗi N step để giảm sync GPU-CPU
@@ -261,7 +381,7 @@ class Trainer:
         # ══════════════════════════════════════════════════════
         # TRAINING LOOP
         # ══════════════════════════════════════════════════════
-        for epoch in range(self.epochs):
+        for epoch in range(self.start_epoch, self.epochs):
             lr_curr = self.optimizer.param_groups[0]['lr']
 
             self.model.train()
@@ -330,6 +450,12 @@ class Trainer:
                 train_loss=train_loss, val_loss=val_loss, val_f1=val_f1,
             )
 
+            # ── Checkpoint: last (luôn ghi đè mỗi epoch — dùng để resume) ──
+            self._save_ckpt(
+                "last.pt", epoch,
+                val_f1=val_f1, val_loss=val_loss, val_acc=val_acc,
+            )
+
             # ── Checkpoint: best F1 ──
             if val_f1 > self.best_f1:
                 self.best_f1 = val_f1
@@ -389,14 +515,22 @@ class Trainer:
             self._load_ckpt("best_f1.pt")
             self.model.eval()
             export_all(
-                model      = self.model,
-                save_dir   = self.save_dir,
-                input_size = self.cfg.get("img_size", 224),
-                yaml_path  = cfg_path,
-                opset      = self.exp_cfg.get("opset", 18),
-                verbose    = True,
+                model         = self.model,
+                save_dir      = self.save_dir,
+                input_size    = self.cfg.get("img_size", 224),
+                yaml_path     = model_yaml,
+                opset         = self.exp_cfg.get("opset", 18),
+                verbose       = True,
+                export_tflite = self.exp_cfg.get("export_tflite", True),
+                test_dir      = self.test_dir,
+                class_names   = self.class_names,
+                tflite_project_dir = self.tflite_project_dir,
+                tflite_mode   = self.exp_cfg.get("tflite_mode", "all"),
+                n_calib       = self.exp_cfg.get("n_calib", 200),
+                mean          = self.norm_mean,
+                std           = self.norm_std,
+                test_loader   = test_loader,
             )
-
         print(f"\n{'='*60}")
         print(f"[✓] Done  best_f1={self.best_f1:.4f}  best_loss={self.best_loss:.4f}")
         print(f"[✓] {self.save_dir}")
@@ -411,7 +545,16 @@ class Trainer:
     # ── Helpers ───────────────────────────────────────────────
     def _save_ckpt(self, name: str, epoch: int, **metrics) -> None:
         torch.save(
-            {"state_dict": self.model.state_dict(), "epoch": epoch, **metrics},
+            {
+                "state_dict": self.model.state_dict(),
+                "epoch":      epoch,
+                "optimizer":  self.optimizer.state_dict(),
+                "scheduler":  self.scheduler.state_dict(),
+                "scaler":     self.scaler.state_dict() if self.use_amp else None,
+                "best_f1":    self.best_f1,
+                "best_loss":  self.best_loss,
+                **metrics,
+            },
             self.save_dir / name,
         )
 
@@ -419,6 +562,6 @@ class Trainer:
         ckpt = torch.load(
             self.save_dir / name,
             map_location=self.device,
-            weights_only=True,
+            weights_only=False,
         )
         self.model.load_state_dict(ckpt["state_dict"])

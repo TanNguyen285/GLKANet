@@ -7,6 +7,9 @@ Dùng như YOLO:
     model = GLKA("simple_glka.yaml")
     model.train("configs/ccmt.yaml")
 
+    # Resume train từ checkpoint đã lưu (last.pt / best_f1.pt / best_loss.pt)
+    model.train("configs/ccmt.yaml", resume_ckpt="runs/exp1/last.pt")
+
     # Val / predict
     model.val("configs/ccmt.yaml")
 
@@ -108,6 +111,7 @@ class GLKA:
     def train(
         self,
         cfg: str | Path,
+        resume_ckpt: str | Path | None = None,
         **overrides,
     ) -> dict:
         from glkanet.data import get_data_loaders
@@ -135,15 +139,27 @@ class GLKA:
         self._model.info()
 
         runs_dir = str(_ROOT / train_cfg.get("logging", {}).get("runs_dir", "runs"))
-        self._save_dir = create_save_dir(runs_dir)
-        print(f"[GLKA] device={train_cfg['hardware']['device']}  "
-              f"save={self._save_dir}")
+
+        if resume_ckpt is not None:
+            # Resume: dùng lại đúng thư mục cha của checkpoint (vd runs/exp1),
+            # KHÔNG tạo exp mới — để log/ckpt tiếp tục nối đúng vào chỗ cũ
+            # thay vì bị tách ra làm hai thư mục exp khác nhau.
+            resume_ckpt = Path(resume_ckpt)
+            if not resume_ckpt.exists():
+                raise FileNotFoundError(f"resume_ckpt không tồn tại: {resume_ckpt}")
+            self._save_dir = resume_ckpt.resolve().parent
+            print(f"[GLKA] Resume từ {resume_ckpt}  save={self._save_dir}")
+        else:
+            self._save_dir = create_save_dir(runs_dir)
+            print(f"[GLKA] device={train_cfg['hardware']['device']}  "
+                  f"save={self._save_dir}")
 
         trainer = Trainer(
             model       = self._model,
             cfg         = train_cfg,
             save_dir    = self._save_dir,
             class_names = class_names,
+            resume_ckpt = resume_ckpt,
         )
         result = trainer.run(
             train_loader = train_loader,

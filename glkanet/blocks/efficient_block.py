@@ -2,53 +2,23 @@ import torch
 import torch.nn as nn
 
 try:
-    from glkanet.blocks.conv_blocks import conv_bn_relu
-    from glkanet.blocks.glka_block  import GLKA
+    from glkanet.blocks.conv_blocks  import conv_bn_relu
+    from glkanet.blocks.glka_shuffle import GLKA_Shuffle
+    from glkanet.blocks.glka_SExCA   import GLKA_SExCA
+    from glkanet.blocks.glka_CA_SE   import GLKA_CA_SE
 except ImportError:
-    from .conv_blocks import conv_bn_relu
-    from .glka_block  import GLKA
+    from .conv_blocks  import conv_bn_relu
+    from .glka_shuffle import GLKA_Shuffle
+    from .glka_SExCA   import GLKA_SExCA
+    from .glka_CA_SE   import GLKA_CA_SE
 
-# ──────────────────────────────────────────────────────────────
-# EfficientBlock — Tree cấu trúc
-# ──────────────────────────────────────────────────────────────
-#
-# EfficientBlock(in_channels, out_channels, stride)
-# │
-# ├── shortcut (nhánh residual, chỉ active khi stride==1)
-# │     ├── stride==1 & in==out  → nn.Identity()
-# │     └── stride==1 & in!=out  → Conv1x1(in→out) + BN
-# │     (stride==2 → không có shortcut, use_residual=False)
-# │
-# └── main path: x → expand → dw/glka → project → (+identity nếu residual)
-#       │
-#       ├── expand: Conv1x1(in_channels → hidden_dim) + BN + ReLU6
-#       │     hidden_dim = in_channels * expansion_ratio
-#       │
-#       ├── dw / glka (rẽ nhánh theo use_glka, chỉ 1 trong 2 active)
-#       │     │
-#       │     ├── use_glka=True:
-#       │     │     ├── dw   = nn.Identity()  (bỏ qua, GLKA tự lo stride)
-#       │     │     └── glka = GLKA(dim=hidden_dim, K=glka_K, stride=stride,
-#       │     │                     se_reduction=se_reduction)
-#       │     │           │
-#       │     │           ├── conv0: DW 5x5 (stride tại đây) + BN + ReLU6
-#       │     │           ├── branches: multi dilated DWConv theo K-preset, sum lại
-#       │     │           ├── SE gate (nếu se_reduction>0) hoặc Identity
-#       │     │           └── output = anchor * (branch_out * gate)
-#       │     │
-#       │     └── use_glka=False:
-#       │           ├── dw   = DWConv3x3(hidden_dim, stride=stride) + BN + ReLU6
-#       │           └── glka = nn.Identity()
-#       │
-#       └── project: Conv1x1(hidden_dim → out_channels) + BN  (không activation)
-#
-# Forward:
-#   identity = shortcut(x)
-#   out = expand(x) → dw(out) → glka(out) → project(out)
-#   return identity + out   if use_residual (stride==1)
-#   return out              if stride==2
-#
-# ──────────────────────────────────────────────────────────────
+GLKA_VARIANTS: dict[str, type] = {
+    "shuffle":  GLKA_Shuffle,  # conv0 -> split -> SE / dilated -> concat -> shuffle -> fuse 1x1 groups=2
+    "sexca":    GLKA_SExCA,    # SE(anchor) * branch_sum
+    "casexse":  GLKA_CA_SE,    # SE(branch_sum)
+}
+GLKA_CLASSES = tuple(GLKA_VARIANTS.values())
+DEFAULT_GLKA_VARIANT = "shuffle"   # <-- đổi ở đây nếu muốn default khác
 
 
 class EfficientBlock(nn.Module):
@@ -60,41 +30,47 @@ class EfficientBlock(nn.Module):
         stride:          int,
         expansion_ratio: int  = 2,
         use_glka:        bool = True,
+        glka_variant:    str  = DEFAULT_GLKA_VARIANT,
         glka_K:          int  = 13,
         se_reduction:    int  = 0,
+        no_residual:     bool = False,
     ):
         super().__init__()
-        self.stride = stride
+        self.in_channels  = in_channels   # để builder._out_channels_of() đọc thẳng, khỏi đoán
+        self.out_channels = out_channels  # ---
+        self.stride       = stride
+        self.glka_variant = glka_variant
+        self.use_glka     = use_glka
         hidden_dim  = in_channels * expansion_ratio
 
-        # s=1 → ép buộc residual dù in≠out (project 1×1 tự match channel)
-        self.use_residual = (stride == 1)
+        self.use_residual = (stride == 1) and not no_residual
 
         # ── Expand ────────────────────────────────────────────────────
         self.expand = conv_bn_relu(in_channels, hidden_dim, kernel_size=1)
 
         # ── Depthwise / GLKA ──────────────────────────────────────────
         if use_glka:
-            # GLKA tự lo stride qua conv0 5×5 — không cần self.dw riêng
+            if glka_variant not in GLKA_VARIANTS:
+                raise ValueError(f"glka_variant='{glka_variant}' không hợp lệ.")
+            glka_cls  = GLKA_VARIANTS[glka_variant]
             self.dw   = nn.Identity()
-            self.glka = GLKA(
+
+            self.glka = glka_cls(
                 dim          = hidden_dim,
+                out_channels = out_channels,
                 K            = glka_K,
-                stride       = stride,       # truyền stride xuống GLKA
+                stride       = stride,
                 se_reduction = se_reduction,
             )
         else:
             self.dw   = conv_bn_relu(hidden_dim, hidden_dim, kernel_size=3,
                                      stride=stride, padding=1, groups=hidden_dim)
-            self.glka = nn.Identity()
+            self.glka = nn.Sequential(
+                nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
 
-        # ── Project ───────────────────────────────────────────────────
-        self.project = nn.Sequential(
-            nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-        )
-
-        # ── Shortcut: pointwise 1×1 nếu in≠out khi s=1 ───────────────
+        # ── Shortcut ─────────────────────────────────────────────────
         if self.use_residual and in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, 1, bias=False),
@@ -104,20 +80,26 @@ class EfficientBlock(nn.Module):
             self.shortcut = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = self.shortcut(x)
         out = self.expand(x)
         out = self.dw(out)
         out = self.glka(out)
-        out = self.project(out)
+
         if self.use_residual:
+            identity = self.shortcut(x)
             return identity + out
         return out
 
+    def switch_to_deploy(self) -> None:
+        """Gọi reparam + fold BN/shuffle cho GLKA con (nếu có switch_to_deploy)."""
+        if hasattr(self.glka, "switch_to_deploy"):
+            self.glka.switch_to_deploy()
+
     def __repr__(self) -> str:
-        glka_info = repr(self.glka) if isinstance(self.glka, GLKA) else "off"
+        glka_info = repr(self.glka) if isinstance(self.glka, GLKA_CLASSES) else "off"
         return (
             f"EfficientBlock("
             f"residual={self.use_residual}, "
             f"stride={self.stride}, "
+            f"variant={self.glka_variant}, "
             f"glka={glka_info})"
         )

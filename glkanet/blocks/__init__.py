@@ -1,29 +1,37 @@
-"""Block registry — mọi block đều đăng ký ở đây để builder.py import."""
+"""glkanet/blocks/__init__.py — Đăng ký các block kiến trúc mạng."""
 
-from .conv_blocks     import ConvBnRelu, conv_bn_relu
-from .se_block        import SEBlock
-from .glka_block      import GLKA
+from .conv_blocks import ConvBnRelu, conv_bn_relu
+from .se_block import SEBlock
 from .efficient_block import EfficientBlock
 from .shuffle_block import ShuffleGLKABlock
 
-# -----------------------------------------------------------------------
-# Registry: map tên string (từ yaml) → class
-# Thêm block mới: chỉ cần import class và đăng ký tên vào đây
-# -----------------------------------------------------------------------
-BLOCK_REGISTRY: dict = {
-    "ConvBnRelu":     ConvBnRelu,
-    "SEBlock":        SEBlock,
-    "GLKA":           GLKA,
+# Import khối đại diện không gian lớn gốc và các biến thể
+from .glka_block_base import GLKA_CBAM
+from .glka_shuffle import GLKA_Shuffle
+from .glka_SExCA import GLKA_SExCA
+from .glka_CA_SE import GLKA_CA_SE
+
+# Registry map tên chuỗi từ YAML sang Class tương ứng
+BLOCK_REGISTRY: dict[str, type] = {
+    "ConvBnRelu": ConvBnRelu,
+    "SEBlock": SEBlock,
     "EfficientBlock": EfficientBlock,
-    "ShuffleGLKABlock":  ShuffleGLKABlock, 
+    "ShuffleGLKABlock": ShuffleGLKABlock,
+    "GLKA_CBAM": GLKA_CBAM,
+    "GLKA_Shuffle": GLKA_Shuffle,
+    "GLKA_SExCA": GLKA_SExCA,
+    "GLKA_CA_SE": GLKA_CA_SE,
 }
 
 __all__ = [
     "ConvBnRelu",
     "conv_bn_relu",
     "SEBlock",
-    "GLKA",
     "EfficientBlock",
-    "BLOCK_REGISTRY",
     "ShuffleGLKABlock",
+    "GLKA_CBAM",
+    "GLKA_Shuffle",
+    "GLKA_SExCA",
+    "GLKA_CA_SE",
+    "BLOCK_REGISTRY",
 ]

@@ -411,6 +411,33 @@ def _print_summary(
 # Main factory — ĐÃ TỐI ƯU PHẦN DATALOADER
 # ──────────────────────────────────────────────────────────────
 
+def _find_ccmt_split_name(root: Path, prefer: str = "train") -> str:
+    """
+    Khi yaml CCMT chỉ khai báo 'path:' (không có 'train:'/'test:' riêng),
+    dcfg.train_dir == dcfg.root, nên không thể lấy split_name từ
+    dcfg.train_dir.name (đó là tên thư mục root, vd "CCMT Dataset-Augmented",
+    KHÔNG phải tên split con thực tế bên trong mỗi group, vd "train_set").
+
+    Hàm này dò split_name thật bằng cách nhìn vào group con đầu tiên
+    (vd root/Cashew/) và liệt kê các thư mục con của nó (vd train_set/,
+    test_set/), rồi chọn cái khớp với `prefer` (ví dụ "train" hoặc "test").
+    """
+    first_group = next((d for d in root.iterdir() if d.is_dir()), None)
+    if first_group is None:
+        raise RuntimeError(f"Không có group folder nào trong: {root}")
+
+    candidates = [d.name for d in first_group.iterdir() if d.is_dir()]
+    if not candidates:
+        raise RuntimeError(f"Group '{first_group.name}' không có thư mục split nào bên trong.")
+
+    match = next((c for c in candidates if re.search(prefer, c, re.IGNORECASE)), None)
+    if match:
+        return match
+
+    # fallback: không tìm thấy theo prefer, lấy candidate đầu tiên
+    return candidates[0]
+
+
 def get_data_loaders(
     data_yaml:  str | Path,
     train_cfg:  dict,
@@ -443,6 +470,14 @@ def get_data_loaders(
     if struct == "missing" and dcfg.root.exists():
         split_name = dcfg.train_dir.name
         struct     = "ccmt"
+    elif struct == "ccmt" and dcfg.train_dir == dcfg.root:
+        # FIX: yaml chỉ có 'path:', không có 'train:' → train_dir trùng root.
+        # Trước đây code lấy split_name = dcfg.train_dir.name, ra
+        # "CCMT Dataset-Augmented" (tên root) thay vì tên split thật
+        # (vd "train_set"), khiến _scan_ccmt_split tìm group/"CCMT
+        # Dataset-Augmented"/ (không tồn tại) → RuntimeError.
+        split_name = _find_ccmt_split_name(dcfg.root, prefer="train")
+        print(f"  [loader] yaml không khai báo 'train:' → tự dò split: '{split_name}'")
     else:
         split_name = dcfg.train_dir.name
 
@@ -462,17 +497,31 @@ def get_data_loaders(
         strategy = "CCMT Augmented — fixed train/test"
         print(f"  [loader] Phát hiện CCMT Augmented tại: {dcfg.root}")
 
-        train_name = dcfg.train_dir.name if dcfg.train_dir.exists() else \
-                     Path(str(dcfg.train_dir)).name
+        train_raw, tr_cls = _scan_ccmt_split(dcfg.root, split_name)
 
-        train_raw, tr_cls = _scan_ccmt_split(dcfg.root, train_name)
-        val_raw,  vl_cls  = (
-            _scan_ccmt_split(dcfg.root, dcfg.val_dir.name)
-            if dcfg.val_dir else (None, [])
+        # val/test: nếu yaml không khai báo val/test riêng, dcfg.val_dir
+        # và dcfg.test_dir sẽ là None → giữ nguyên hành vi cũ (None),
+        # _apply_split_strategy sẽ tự tách val/test từ train bằng
+        # stratified split.
+        val_split_name = dcfg.val_dir.name if dcfg.val_dir and dcfg.val_dir != dcfg.root else None
+        test_split_name = dcfg.test_dir.name if dcfg.test_dir and dcfg.test_dir != dcfg.root else None
+
+        # Nếu yaml không khai báo test: nhưng cấu trúc CCMT thường có sẵn
+        # test_set/ cố định trong mỗi group, tự dò luôn cho tiện (giữ đúng
+        # tinh thần "CCMT Augmented — fixed train/test" của strategy này).
+        if test_split_name is None:
+            try:
+                test_split_name = _find_ccmt_split_name(dcfg.root, prefer="test")
+            except RuntimeError:
+                test_split_name = None
+
+        val_raw, vl_cls = (
+            _scan_ccmt_split(dcfg.root, val_split_name)
+            if val_split_name else (None, [])
         )
-        test_raw, te_cls  = (
-            _scan_ccmt_split(dcfg.root, dcfg.test_dir.name)
-            if dcfg.test_dir else (None, [])
+        test_raw, te_cls = (
+            _scan_ccmt_split(dcfg.root, test_split_name)
+            if test_split_name else (None, [])
         )
 
         all_cls = set(tr_cls)

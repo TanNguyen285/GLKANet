@@ -156,6 +156,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+venv-tflite/
+
 
 # Spyder project settings
 .spyderproject

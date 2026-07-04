@@ -1,8 +1,3 @@
-# ============================================================
-# configs/dataset.yaml — Data config (YOLO-style)
-# Đổi dataset: chỉ sửa file này, không đụng train.yaml
-# ============================================================
-
-# Root dataset (absolute path)
 path: C:\Users\ThisPC\Desktop\Raw Data\CCMT Dataset
-
+train: train_set
+test: test_set
