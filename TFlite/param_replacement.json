@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "operations": [
+    {
+      "op_name": "wa/m/backbone_layers.2/Concat",
+      "param_target": "inputs",
+      "param_name": "/m/backbone_layers.2/Slice_output_0",
+      "pre_process_transpose_perm": [0, 2, 3, 1]
+    },
+    {
+      "op_name": "wa/m/backbone_layers.4/Concat",
+      "param_target": "inputs",
+      "param_name": "/m/backbone_layers.4/Slice_output_0",
+      "pre_process_transpose_perm": [0, 2, 3, 1]
+    },
+    {
+      "op_name": "wa/m/backbone_layers.6/Concat",
+      "param_target": "inputs",
+      "param_name": "/m/backbone_layers.6/Slice_output_0",
+      "pre_process_transpose_perm": [0, 2, 3, 1]
+    }
+  ]
+}

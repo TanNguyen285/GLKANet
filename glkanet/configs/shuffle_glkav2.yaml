@@ -37,16 +37,16 @@ backbone:
   - [-1, 1, ConvBnRelu,       [32,  3, 2, 1, 1, false]]
 
   # Stage 1: Shallow features (Output: 56x56)
-  - [-1, 1, ShuffleGLKABlock, [64,  2, 0.5, true, 3, 8]]
-  - [-1, 1, ShuffleGLKABlock, [64,  1, 0.5, true,  3, 8]]
+  - [-1, 1, ShuffleGLKABlock, [64,  2, 1, true, 3, 16]]
+  - [-1, 1, ShuffleGLKABlock, [64,  1, 0.75, true,  3, 16]]
 
   # Stage 2: Mid-level features (Output: 28x28)
-  - [-1, 1, ShuffleGLKABlock, [128, 2, 0.5,  true,  3, 8]]
-  - [-1, 1, ShuffleGLKABlock, [128, 1, 0.5,  true,  3, 8]]
+  - [-1, 1, ShuffleGLKABlock, [128, 2, 1,  true,  3, 16]]
+  - [-1, 1, ShuffleGLKABlock, [128, 1, 0.75,  true,  7, 4]]
 
   # Stage 3: Deep features with Large Kernel & SE Attention (Output: 14x14)
-  - [-1, 1, ShuffleGLKABlock, [256, 2, 0.5, true,  3, 4]]
-  - [-1, 1, ShuffleGLKABlock, [256, 1, 0.5, true,  3, 4]]
+  - [-1, 1, ShuffleGLKABlock, [256, 2, 1, true,  3, 16]]
+  - [-1, 1, ShuffleGLKABlock, [256, 1, 0.75, true,  7, 4]]
 
   # Stage 4: High-level context extraction (Output: 7x7)
-  - [-1, 1, ShuffleGLKABlock, [512, 2, 0.75, true,  7, 4]]
+  - [-1, 1, ShuffleGLKABlock, [512, 2, 1, true,  3, 16]]

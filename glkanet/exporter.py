@@ -2,6 +2,10 @@
 tự động + chạy test trên test set. TFLite (convert + eval accuracy ONNX/TFLite) được
 đẩy hoàn toàn sang subprocess venv-tflite (environment.py) để tránh xung đột môi trường
 torch <-> tensorflow/onnx2tf trong cùng 1 process.
+
+BẢN SỬA: thêm bước tự động gọi bench_dataset.py (đo latency/FPS/accuracy THẬT trên
+toàn bộ test_set, có warmup 100 lần + nghỉ giữa các model) ngay sau khi TFLite export
+xong, merge kết quả vào bảng tổng kết cuối cùng.
 """
 
 from __future__ import annotations
@@ -200,6 +204,85 @@ def _run_tflite_pipeline(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Benchmark thật (latency/FPS/accuracy có warmup + nghỉ giữa model) — gọi
+#  bench_dataset.py qua subprocess venv-tflite, TÁCH BIỆT với environment.py
+# ═══════════════════════════════════════════════════════════════════════
+
+def _run_bench_dataset(
+    tflite_dir:   Path,
+    onnx_path:    Path,
+    dataset_yaml: str | Path | None,
+    input_size:   int,
+    tflite_project_dir: str | Path,
+    verbose: bool = True,
+) -> dict:
+    """Gọi bench_dataset.py trong venv-tflite để đo latency/FPS/accuracy thật trên
+    TOÀN BỘ test_set cho ONNX + cả 3 file tflite (fp32/fp16/int8) vừa xuất, có
+    warmup 100 lần + nghỉ 3s giữa mỗi model (khác với backend_eval trong
+    _run_tflite_pipeline — cái đó chỉ eval accuracy nhanh, KHÔNG đo latency chuẩn).
+
+    Không raise nếu lỗi — chỉ log cảnh báo, không làm gãy pipeline export.
+
+    Yêu cầu bench_dataset.py nằm CÙNG THƯ MỤC với environment.py/onnx_to_tflite.py
+    (tflite_project_dir), và hỗ trợ --tflite-dir để tự quét nhiều file .tflite.
+    """
+    if not dataset_yaml:
+        if verbose:
+            print("  [bench] Không có dataset_yaml — bỏ qua bench_dataset.py.")
+        return {}
+
+    tflite_project_dir = Path(tflite_project_dir)
+    bench_script = tflite_project_dir / "bench_dataset.py"
+    if not bench_script.exists():
+        if verbose:
+            print(f"  [bench] Không tìm thấy {bench_script} — bỏ qua bước benchmark.")
+        return {}
+
+    venv_py = tflite_project_dir / "venv-tflite" / (
+        "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
+    )
+    python_exe = str(venv_py) if venv_py.exists() else sys.executable
+
+    bench_out_dir = tflite_dir / "bench_results"
+    cmd = [
+        python_exe, str(bench_script),
+        "--dataset-yaml", str(dataset_yaml),
+        "--onnx", str(onnx_path),
+        "--tflite-dir", str(tflite_dir),
+        "--input-size", str(input_size),
+        "--out", str(bench_out_dir),
+    ]
+
+    if verbose:
+        print(f"  [bench] Gọi bench_dataset.py trên toàn bộ test_set:\n           {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, capture_output=not verbose, text=True)
+    if result.returncode != 0:
+        if verbose:
+            print("  [bench] CẢNH BÁO: benchmark thất bại (bỏ qua, không làm gãy export).")
+            if result.stdout:
+                print(result.stdout[-3000:])
+            if result.stderr:
+                print(result.stderr[-3000:])
+        return {}
+
+    if not bench_out_dir.exists():
+        return {}
+    json_files = sorted(bench_out_dir.glob("bench_dataset_*.json"))
+    if not json_files:
+        if verbose:
+            print(f"  [bench] CẢNH BÁO: không tìm thấy file kết quả json trong {bench_out_dir}")
+        return {}
+    try:
+        data = json.loads(json_files[-1].read_text(encoding="utf-8"))
+        return data.get("results", {})
+    except Exception as e:  # noqa: BLE001
+        if verbose:
+            print(f"  [bench] CẢNH BÁO: không đọc được kết quả bench: {e}")
+        return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Export pipeline chính
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -216,6 +299,7 @@ def export_all(
     # ── TFLite (subprocess venv-tflite) ─────────────────────
     export_tflite: bool = True,
     test_dir:      str | None = None,
+    dataset_yaml:  str | Path | None = None,
     class_names:   list[str] | None = None,
     tflite_project_dir: str | Path = "TFlite",
     tflite_mode:   str = "all",
@@ -227,9 +311,9 @@ def export_all(
 ) -> dict[str, Path | dict | bool | None]:
     """Xuất train / deploy / onnx, kèm validate, rồi (nếu export_tflite=True) đẩy
     ONNX sang subprocess venv-tflite để convert TFLite + eval accuracy ONNX/TFLite
-    trên test_dir thật (dùng đúng mean/std normalize như lúc train). Nếu test_loader
-    được truyền, tự chạy accuracy torch trong process chính và gộp chung vào
-    test_results.
+    trên test_dir thật, SAU ĐÓ tự động benchmark latency/FPS thật (bench_dataset.py)
+    trên toàn bộ test_set nếu có dataset_yaml. Nếu test_loader được truyền, tự chạy
+    thêm accuracy torch trong process chính và gộp chung vào test_results.
 
     Args:
         model:         GLKANet ở eval mode
@@ -241,10 +325,16 @@ def export_all(
         validate:      bật/tắt validate train-vs-deploy-vs-onnx
         atol/rtol:     ngưỡng sai số logits fp32
         export_tflite: bật/tắt convert + eval TFLite qua subprocess
-        test_dir:      thư mục ảnh test THẬT dạng ImageFolder — bắt buộc nếu muốn
-                       eval accuracy ONNX/TFLite
+        test_dir:      thư mục ảnh test THẬT dạng ImageFolder — dùng để eval accuracy
+                       nhanh (backend_eval) VÀ làm calib_dir cho int8
+        dataset_yaml:  path tới dataset.yaml (path/train/test) — nếu truyền vào,
+                       tự động gọi bench_dataset.py để đo latency/FPS/accuracy thật
+                       trên toàn bộ test_set (có warmup + nghỉ giữa model, giống
+                       benchmark chuẩn kiểu YOLO). Bỏ trống thì chỉ có backend_eval
+                       nhanh từ bước TFLite, không có bench thật.
         class_names:   list tên class đúng thứ tự index model output
         tflite_project_dir: path tới thư mục chứa environment.py + onnx_to_tflite.py
+                       + bench_dataset.py
         tflite_mode:   "fp32" | "fp16" | "int8" | "all"
         n_calib:       số ảnh dùng calibrate int8
         mean/std:      normalize PHẢI khớp transforms.Normalize() lúc train
@@ -333,7 +423,7 @@ def export_all(
         )
         all_valid &= ok_onnx
 
-    # ── 4. TFLite (subprocess venv-tflite: convert + eval accuracy) ──
+    # ── 4. TFLite (subprocess venv-tflite: convert + eval accuracy nhanh) ──
     tflite_dir = None
     backend_eval: dict = {}
     if export_tflite:
@@ -351,6 +441,18 @@ def export_all(
             verbose=verbose,
         )
 
+    # ── 4b. Benchmark thật (latency/FPS/accuracy) trên toàn bộ test_set ──
+    bench_results: dict = {}
+    if export_tflite and tflite_dir is not None:
+        bench_results = _run_bench_dataset(
+            tflite_dir=tflite_dir,
+            onnx_path=path_onnx,
+            dataset_yaml=dataset_yaml,
+            input_size=input_size,
+            tflite_project_dir=tflite_project_dir,
+            verbose=verbose,
+        )
+
     # ── 5. Copy yaml kiến trúc ────────────────────────────────
     path_yaml = weights_dir / yaml_path.name
     shutil.copy2(yaml_path, path_yaml)
@@ -362,25 +464,52 @@ def export_all(
         if validate:
             print(f"  [export] validate tổng: {'OK' if all_valid else 'CÓ MISMATCH — xem log ở trên'}")
 
-    # ── 6. Test torch (process chính) + gộp kết quả onnx/tflite từ subprocess ──
+    # ── 6. Gộp toàn bộ kết quả: torch + backend_eval (nhanh) + bench (thật) ──
     test_results = None
-    if test_loader is not None or backend_eval:
+    if test_loader is not None or backend_eval or bench_results:
         test_results = {}
         if test_loader is not None:
             model_deploy.eval()
             acc_torch, ms_torch = _eval_torch(model_deploy, test_loader)
             test_results["torch"] = {"acc": acc_torch, "ms_per_img": ms_torch}
+
         test_results.update(backend_eval)
 
+        # bench_results có latency/FPS đo THẬT trên máy đích (có warmup chuẩn,
+        # nghỉ giữa model) -> ưu tiên đè lên ms_per_img từ backend_eval (vốn chỉ
+        # đo trong-process, không warmup, dễ bị nhiễu bởi lần chạy đầu).
+        for name, entry in bench_results.items():
+            if not isinstance(entry, dict) or "result" not in entry:
+                continue
+            res = entry["result"]
+            if "error" in res:
+                continue
+            slot = test_results.setdefault(name, {})
+            slot["acc"] = res.get("accuracy", slot.get("acc"))
+            slot["ms_per_img"] = res.get("latency_mean_ms", slot.get("ms_per_img"))
+            slot["fps"] = res.get("throughput_fps")
+            slot["peak_rss_mb"] = res.get("peak_rss_mb")
+
         if verbose:
-            print("\n  [test] ═══ Kết quả trên test set (torch + onnx/tflite qua subprocess) ═══")
-            print(f"  {'Backend':<25} {'Accuracy':>10} {'ms/ảnh':>10}")
-            print(f"  {'-'*25} {'-'*10} {'-'*10}")
-            for name, r in test_results.items():
-                if isinstance(r, dict) and "acc" in r:
-                    print(f"  {name:<25} {r['acc']*100:>9.2f}% {r['ms_per_img']:>9.2f}")
-                else:
-                    print(f"  {name:<25} {'--- lỗi/không có':>21}")
+            has_fps = any(isinstance(r, dict) and "fps" in r for r in test_results.values())
+            print("\n  [test] ═══ Kết quả trên test set (torch + onnx/tflite + bench thật) ═══")
+            if has_fps:
+                print(f"  {'Backend':<25} {'Accuracy':>10} {'ms/ảnh':>10} {'FPS':>10}")
+                print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*10}")
+                for name, r in test_results.items():
+                    if isinstance(r, dict) and "acc" in r:
+                        fps_str = f"{r['fps']:.2f}" if r.get("fps") is not None else "-"
+                        print(f"  {name:<25} {r['acc']*100:>9.2f}% {r['ms_per_img']:>9.2f} {fps_str:>10}")
+                    else:
+                        print(f"  {name:<25} {'--- lỗi/không có':>21}")
+            else:
+                print(f"  {'Backend':<25} {'Accuracy':>10} {'ms/ảnh':>10}")
+                print(f"  {'-'*25} {'-'*10} {'-'*10}")
+                for name, r in test_results.items():
+                    if isinstance(r, dict) and "acc" in r:
+                        print(f"  {name:<25} {r['acc']*100:>9.2f}% {r['ms_per_img']:>9.2f}")
+                    else:
+                        print(f"  {name:<25} {'--- lỗi/không có':>21}")
 
     return {
         "train":        path_train,

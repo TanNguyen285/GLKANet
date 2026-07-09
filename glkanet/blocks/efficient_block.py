@@ -44,6 +44,7 @@ class EfficientBlock(nn.Module):
         hidden_dim  = in_channels * expansion_ratio
 
         self.use_residual = (stride == 1) and not no_residual
+        self._deployed    = False  # guard chống fold BN nhiều lần (idempotent)
 
         # ── Expand ────────────────────────────────────────────────────
         self.expand = conv_bn_relu(in_channels, hidden_dim, kernel_size=1)
@@ -90,9 +91,60 @@ class EfficientBlock(nn.Module):
         return out
 
     def switch_to_deploy(self) -> None:
-        """Gọi reparam + fold BN/shuffle cho GLKA con (nếu có switch_to_deploy)."""
+        """Gọi reparam + fold BN/shuffle cho GLKA con, đồng thời fold nốt
+        expand / dw (khi use_glka=False, dw là conv_bn_relu thật) và shortcut
+        (khi in!=out) nếu Conv gốc đang bias=False (thật sự có BN theo sau
+        cần fold). Idempotent nhờ guard self._deployed."""
+        if self._deployed:
+            return
+
         if hasattr(self.glka, "switch_to_deploy"):
             self.glka.switch_to_deploy()
+
+        if isinstance(self.expand, nn.Sequential) and self._seq_is_conv_bn(self.expand):
+            self.expand = self._fold_conv_bn_seq(self.expand)
+
+        if isinstance(self.dw, nn.Sequential) and self._seq_is_conv_bn(self.dw):
+            self.dw = self._fold_conv_bn_seq(self.dw)
+
+        if isinstance(self.shortcut, nn.Sequential) and self._seq_is_conv_bn(self.shortcut):
+            self.shortcut = self._fold_conv_bn_seq(self.shortcut)
+
+        self._deployed = True
+
+    @staticmethod
+    def _seq_is_conv_bn(seq: nn.Sequential) -> bool:
+        """Chỉ fold khi seq[0] là Conv2d bias=False và seq[1] là BatchNorm2d
+        (đúng pattern conv_bn_relu / shortcut trong file này)."""
+        return (
+            len(seq) >= 2
+            and isinstance(seq[0], nn.Conv2d)
+            and seq[0].bias is None
+            and isinstance(seq[1], nn.BatchNorm2d)
+        )
+
+    @staticmethod
+    def _fold_conv_bn_seq(seq: nn.Sequential) -> nn.Sequential:
+        """Fold seq[0]=Conv2d(bias=False) + seq[1]=BatchNorm2d thành 1 Conv2d
+        bias=True, giữ nguyên các layer phía sau (vd ReLU6) không đổi thứ tự."""
+        conv: nn.Conv2d      = seq[0]
+        bn:   nn.BatchNorm2d = seq[1]
+
+        std = (bn.running_var + bn.eps).sqrt()
+        t   = (bn.weight / std).reshape(-1, 1, 1, 1)
+        b_conv  = torch.zeros(conv.out_channels, device=conv.weight.device)
+        w_fused = conv.weight * t
+        b_fused = bn.bias + (b_conv - bn.running_mean) * (bn.weight / std)
+
+        new_conv = nn.Conv2d(
+            conv.in_channels, conv.out_channels, conv.kernel_size,
+            stride=conv.stride, padding=conv.padding, groups=conv.groups, bias=True,
+        )
+        new_conv.weight.data = w_fused
+        new_conv.bias.data   = b_fused
+
+        rest = list(seq[2:])
+        return nn.Sequential(new_conv, *rest)
 
     def __repr__(self) -> str:
         glka_info = repr(self.glka) if isinstance(self.glka, GLKA_CLASSES) else "off"

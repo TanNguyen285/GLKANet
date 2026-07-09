@@ -311,7 +311,9 @@ class GLKA:
                 raise RuntimeError(
                     "Cần truyền model_yaml vào GLKA() để load checkpoint.")
             sd = ckpt["state_dict"]
-            nc = sd["head.classifier.4.weight"].shape[0]
+            linear_keys = [k for k in sd if k.startswith("head.classifier.") and k.endswith(".weight") and sd[k].dim() == 2]
+            last_key = max(linear_keys, key=lambda k: int(k.split(".")[2]))
+            nc = sd[last_key].shape[0]
             self._model = self._build_with_nc(nc)
 
         self._model.load_state_dict(ckpt["state_dict"])

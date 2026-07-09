@@ -1,6 +1,21 @@
 """glkanet/onnx_to_tflite.py — Convert best_deploy.onnx -> TFLite (fp32/fp16/int8)
 để test FPS trên Raspberry Pi, và eval accuracy ONNX + TFLite trên test set thật.
 
+BẢN SỬA:
+  - Dùng file `param_replacement.json` TĨNH đặt CÙNG THƯ MỤC với script này (nếu có)
+    để truyền thẳng vào onnx2tf ngay từ đầu, KHÔNG cần đợi convert lỗi rồi mới đọc
+    file auto-gen (auto-gen vẫn được giữ làm fallback nếu convert lỗi và chưa có
+    file tĩnh, y như bản cũ).
+  - Output cuối cùng trong `out_dir` được RENAME cố định:
+        best_deploy_fp32.tflite
+        best_deploy_fp16.tflite
+        best_deploy_int8.tflite
+    (tên onnx gốc, không lệ thuộc mode chạy — dễ để bench_dataset.py / exporter.py
+    tham chiếu cứng tên file).
+  - Dọn sạch mọi rác trung gian sau khi convert xong: saved_model/, dummy test data,
+    calib npy, legacy cache — out_dir cuối cùng CHỈ còn 3 file .tflite (+ file eval
+    json nếu có --test-dir).
+
 =====================================================================
 CÀI ĐẶT (Python 3.10.11) — dùng venv riêng, KHÔNG cài chung venv train:
 
@@ -18,9 +33,10 @@ CÁCH DÙNG:
         --test-dir dataset/test --class-names class0,class1,class2 \
         --mean 0.485,0.456,0.406 --std 0.229,0.224,0.225
 
-    --mode fp32   -> chỉ lấy model_float32.tflite
-    --mode fp16   -> chỉ lấy model_float16.tflite
-    --mode int8   -> chỉ lấy model_integer_quant.tflite (BẮT BUỘC --calib-dir)
+    --mode fp32   -> chỉ lấy best_deploy_fp32.tflite
+    --mode fp16   -> chỉ lấy best_deploy_fp16.tflite
+    --mode int8   -> chỉ lấy best_deploy_int8.tflite (BẮT BUỘC --calib-dir để quant thật,
+                     nếu không có sẽ dùng dynamic range quant)
     --mode all    -> lấy hết (mặc định)
 
     --test-dir    -> nếu truyền vào, sau khi convert xong sẽ tự eval accuracy
@@ -30,6 +46,13 @@ CÁCH DÙNG:
     --mean/--std  -> PHẢI khớp đúng transforms.Normalize() lúc train (xem train.yaml
                      mục normalize:). Mặc định ImageNet [0.485,0.456,0.406] /
                      [0.229,0.224,0.225] nếu không truyền.
+
+Muốn tự set param_replacement (né lỗi transpose layout ở 1 số node Concat cụ thể,
+ví dụ backbone_layers.2/4/6 như đã gặp), đặt file tên đúng:
+
+    <cùng thư mục với script này>/param_replacement.json
+
+script sẽ tự đọc và dùng ngay lần convert đầu tiên, không cần đợi lỗi.
 """
 
 from __future__ import annotations
@@ -43,11 +66,26 @@ from pathlib import Path
 
 import numpy as np
 
+HERE = Path(__file__).resolve().parent
+PARAM_REPLACEMENT_FILE = HERE / "param_replacement.json"
 
 REQUIRED_PACKAGES = ("onnx", "onnx2tf", "tensorflow", "onnxsim")
 
 DEFAULT_MEAN = (0.485, 0.456, 0.406)
 DEFAULT_STD  = (0.229, 0.224, 0.225)
+
+# Tên file cuối cùng cố định, không lệ thuộc naming của onnx2tf.
+FINAL_NAMES = {
+    "fp32": "best_deploy_fp32.tflite",
+    "fp16": "best_deploy_fp16.tflite",
+    "int8": "best_deploy_int8.tflite",
+}
+# Từ khóa onnx2tf dùng để nhận diện file nó sinh ra, map sang key FINAL_NAMES.
+SOURCE_KEYWORDS = {
+    "fp32": ("float32",),
+    "fp16": ("float16",),
+    "int8": ("integer_quant", "dynamic_range_quant", "int8"),
+}
 
 
 def _check_deps() -> None:
@@ -92,11 +130,8 @@ def _build_calibration_npy(
     mean: tuple[float, float, float] = DEFAULT_MEAN,
     std: tuple[float, float, float] = DEFAULT_STD,
 ) -> Path:
-    """Đọc ảnh thật, resize + normalize ĐÚNG như lúc train (mean/std ImageNet mặc định),
-    gộp thành 1 file .npy shape (N, H, W, 3) float32 — format onnx2tf cần cho quant int8.
-
-    QUAN TRỌNG: mean/std truyền vào đây PHẢI khớp transforms.Normalize() lúc train,
-    nếu không phân phối dữ liệu calibrate sẽ sai lệch, kéo theo quant int8 sai range.
+    """Đọc ảnh thật, resize + normalize ĐÚNG như lúc train, gộp thành 1 file .npy
+    shape (N, H, W, 3) float32 — format onnx2tf cần cho quant int8.
     """
     from PIL import Image
 
@@ -129,7 +164,10 @@ def convert(
     n_calib: int = 200,
     mean: tuple[float, float, float] = DEFAULT_MEAN,
     std: tuple[float, float, float] = DEFAULT_STD,
-) -> None:
+    keep_intermediate: bool = False,
+) -> dict[str, Path]:
+    """Convert ONNX -> TFLite, trả về dict {"fp32"|"fp16"|"int8": Path} cho các file
+    THỰC SỰ được sinh ra (chỉ chứa key khớp --mode)."""
     _check_deps()
     import onnx2tf
 
@@ -146,16 +184,18 @@ def convert(
 
     print(f"[1/2] Convert ONNX -> TF SavedModel + TFLite (onnx2tf): {onnx_path.name}")
 
+    # onnx2tf phiên bản cũ cần 1 file cache "legacy" nằm ở cwd, tự tạo dummy nếu thiếu.
     legacy_cache_name = "calibration_image_sample_data_20x128x128x3_float32.npy"
     legacy_cache_path = Path.cwd() / legacy_cache_name
+    legacy_cache_created = False
     if not legacy_cache_path.exists():
         dummy_legacy = np.random.rand(20, 128, 128, 3).astype(np.float32)
         np.save(legacy_cache_path, dummy_legacy)
+        legacy_cache_created = True
 
     test_data_path = out_dir / "_dummy_test_data.npy"
-    if not test_data_path.exists():
-        dummy = np.random.rand(1, input_size, input_size, 3).astype(np.float32)
-        np.save(test_data_path, dummy)
+    dummy = np.random.rand(1, input_size, input_size, 3).astype(np.float32)
+    np.save(test_data_path, dummy)
 
     kwargs = dict(
         input_onnx_file_path=str(onnx_path),
@@ -165,16 +205,17 @@ def convert(
         test_data_nhwc_path=str(test_data_path),
     )
 
+    npy_calib_path = None
     if need_int8:
         if calib_dir:
             input_name = _get_onnx_input_name(onnx_path)
-            npy_path = _build_calibration_npy(
+            npy_calib_path = _build_calibration_npy(
                 calib_dir, input_size, n_calib, out_dir, mean=mean, std=std,
             )
             # Ảnh trong npy đã normalize (mean/std) sẵn -> báo onnx2tf mean=0, std=1
-            # để nó KHÔNG normalize thêm lần nữa (tránh normalize 2 lần chồng nhau).
+            # để nó KHÔNG normalize thêm lần nữa.
             kwargs["custom_input_op_name_np_data_path"] = [
-                [input_name, str(npy_path), [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
+                [input_name, str(npy_calib_path), [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
             ]
             kwargs["output_integer_quantized_tflite"] = True
         else:
@@ -182,10 +223,13 @@ def convert(
                   "(int8 weight-only, không cần ảnh calib).")
             kwargs["output_dynamic_range_quantized_tflite"] = True
 
-    # =====================================================================
-    # ĐOẠN SỬA ĐƯỜNG DẪN AUTO JSON ĐỂ KÍCH HOẠT RETRY:
-    # =====================================================================
-    # SỬA TẠI ĐÂY: onnx2tf sinh file JSON nằm TRONG thư mục saved_model
+    # ── Param replacement: ưu tiên file TĨNH cạnh script, nếu có dùng luôn ──
+    used_static_param_file = False
+    if PARAM_REPLACEMENT_FILE.exists():
+        print(f"[param_replacement] Dùng file tĩnh có sẵn: {PARAM_REPLACEMENT_FILE}")
+        kwargs["param_replacement_file"] = str(PARAM_REPLACEMENT_FILE)
+        used_static_param_file = True
+
     auto_json_path = saved_model_dir / f"{onnx_path.stem}_auto.json"
 
     def _do_convert(**kw):
@@ -202,7 +246,10 @@ def convert(
         else:
             raise
     except Exception as e:
-        # onnx2tf tự sinh file sửa layout tại saved_model_dir / f"{onnx_path.stem}_auto.json"
+        if used_static_param_file:
+            # Đã dùng file tĩnh rồi mà vẫn lỗi -> không retry mù, báo luôn.
+            print(f"[LỖI] Convert thất bại dù đã dùng param_replacement.json tĩnh: {e}")
+            raise
         if auto_json_path.exists():
             print(f"\n[RETRY] Convert lỗi ({e.__class__.__name__}). onnx2tf đã tự sinh "
                   f"file sửa layout tại:\n         {auto_json_path}\n"
@@ -210,45 +257,51 @@ def convert(
             kwargs["param_replacement_file"] = str(auto_json_path)
             try:
                 _do_convert(**kwargs)
-                print("[RETRY] Convert lại thành công với auto JSON!")
+                print("[RETRY] Convert lại thành công với auto JSON! "
+                      f"Khuyên: copy nội dung {auto_json_path} thành "
+                      f"{PARAM_REPLACEMENT_FILE.name} cạnh script để lần sau khỏi retry.")
             except Exception as e2:
                 print(f"[LỖI] Convert lại với auto JSON vẫn thất bại: {e2}")
-                print(f"      Cần sửa thủ công file JSON tại {auto_json_path} — "
-                      f"xem hướng dẫn: https://github.com/PINTO0309/onnx2tf#parameter-replacement")
                 raise
         else:
             print(f"[THÔNG BÁO] Không tìm thấy file JSON tự động tại: {auto_json_path}")
             raise
-    # =====================================================================
 
-    print("[2/2] Sắp xếp lại file .tflite ra out_dir gốc, dễ copy sang Pi")
+    print("[2/2] Rename + copy .tflite cần dùng ra out_dir gốc")
     produced = list(saved_model_dir.glob("*.tflite"))
     if not produced:
         print("[CẢNH BÁO] Không thấy file .tflite nào được sinh ra — kiểm tra log onnx2tf ở trên.")
-        return
+        return {}
 
-    keep_keywords = {
-        "fp32": ("float32",),
-        "fp16": ("float16",),
-        "int8": ("integer_quant", "dynamic_range_quant", "int8"),
-        "all": ("float32", "float16", "integer_quant", "dynamic_range_quant", "int8"),
-    }[mode]
+    wanted_keys = ("fp32", "fp16", "int8") if mode == "all" else (mode,)
 
-    copied = []
-    for f in produced:
-        if any(k in f.name for k in keep_keywords):
-            dst = out_dir / f.name
-            shutil.copy2(f, dst)
-            size_mb = dst.stat().st_size / 1024 / 1024
-            print(f"  -> {dst.name:<40} {size_mb:.2f} MB")
-            copied.append(dst)
+    result: dict[str, Path] = {}
+    for key in wanted_keys:
+        match = next((f for f in produced if any(k in f.name for k in SOURCE_KEYWORDS[key])), None)
+        if match is None:
+            continue
+        dst = out_dir / FINAL_NAMES[key]
+        shutil.copy2(match, dst)
+        size_mb = dst.stat().st_size / 1024 / 1024
+        print(f"  -> {dst.name:<28} {size_mb:.2f} MB")
+        result[key] = dst
 
-    if not copied:
-        print("[CẢNH BÁO] Không có file nào khớp --mode, kiểm tra lại tên file trong "
-              f"{saved_model_dir}")
-        return
+    if not result:
+        print(f"[CẢNH BÁO] Không có file nào khớp --mode, kiểm tra lại tên file trong {saved_model_dir}")
+
+    # ── Dọn rác trung gian ──────────────────────────────────────────
+    if not keep_intermediate:
+        if saved_model_dir.exists():
+            shutil.rmtree(saved_model_dir, ignore_errors=True)
+        for p in (test_data_path, npy_calib_path):
+            if p is not None and Path(p).exists():
+                Path(p).unlink(missing_ok=True)
+        if legacy_cache_created and legacy_cache_path.exists():
+            legacy_cache_path.unlink(missing_ok=True)
+        print("[dọn dẹp] Đã xóa saved_model/ + file tạm — out_dir chỉ còn .tflite cuối cùng.")
 
     print(f"\nXong. Các file .tflite nằm trong '{out_dir}'.")
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -266,10 +319,6 @@ def _load_test_set(
     mean: tuple[float, float, float] = DEFAULT_MEAN,
     std: tuple[float, float, float] = DEFAULT_STD,
 ):
-    """Đọc toàn bộ ảnh test thật từ thư mục dạng ImageFolder (class_name/*.jpg),
-    normalize ĐÚNG mean/std lúc train (mặc định ImageNet). Trả về ảnh đã normalize
-    dạng NHWC float32 — dùng chung cho cả ONNX (transpose sang NCHW sau) và TFLite.
-    """
     from PIL import Image
 
     test_dir = Path(test_dir)
@@ -305,7 +354,6 @@ def _eval_onnx_backend(onnx_path: Path, images_nhwc: np.ndarray, labels: np.ndar
 
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     input_name = sess.get_inputs()[0].name
-    # ONNX wrapper export dùng NCHW (xem exporter.py: dummy = [1,3,H,W])
     images_nchw = np.transpose(images_nhwc, (0, 3, 1, 2)).astype(np.float32)
 
     correct, total = 0, 0
@@ -327,10 +375,6 @@ def _eval_tflite_backend(tflite_path: Path, images_nhwc: np.ndarray, labels: np.
     input_details = interpreter.get_input_details()[0]
     output_details = interpreter.get_output_details()[0]
 
-    # images_nhwc đã normalize (mean/std) sẵn -> nếu input model là float thì dùng
-    # thẳng; nếu model int8 (full-integer quant) thì cần quantize lại theo scale/
-    # zero_point riêng của input đó (KHÁC với normalize ảnh, đây là bước lượng tử
-    # hoá thêm sau khi đã normalize).
     x = images_nhwc
     if input_details["dtype"] in (np.int8, np.uint8):
         scale, zero_point = input_details["quantization"]
@@ -366,8 +410,6 @@ def evaluate_backends(
     mean: tuple[float, float, float] = DEFAULT_MEAN,
     std: tuple[float, float, float] = DEFAULT_STD,
 ) -> dict:
-    """Chạy accuracy test trên ONNX + mọi file .tflite trong tflite_dir, cùng 1 test set thật.
-    Ghi kết quả ra eval_out_json để process train (có torch) đọc lại."""
     print(f"[eval] Đang load test set từ {test_dir} (mean={mean}, std={std}) ...")
     images_nhwc, labels, classes = _load_test_set(test_dir, input_size, class_names, mean=mean, std=std)
     print(f"[eval] {len(labels)} ảnh, {len(classes)} class.")
@@ -380,8 +422,11 @@ def evaluate_backends(
         results["onnx"] = _eval_onnx_backend(onnx_path, images_nhwc, labels)
         print(f"       acc={results['onnx']['acc']*100:.2f}%  {results['onnx']['ms_per_img']:.2f} ms/ảnh")
 
-    for tflite_path in sorted(Path(tflite_dir).glob("*.tflite")):
-        key = tflite_path.stem
+    # Chỉ eval đúng 3 file cố định (nếu có), không quét rác cũ còn sót.
+    for key, fname in FINAL_NAMES.items():
+        tflite_path = Path(tflite_dir) / fname
+        if not tflite_path.exists():
+            continue
         print(f"[eval] Đang test TFLite [{key}]...")
         try:
             results[key] = _eval_tflite_backend(tflite_path, images_nhwc, labels)
@@ -419,12 +464,10 @@ def _cli() -> None:
                      help="Danh sách class cách nhau bởi dấu phẩy, PHẢI đúng thứ tự index lúc train")
     ap.add_argument("--eval-out", default=None,
                      help="Path json ghi kết quả eval (mặc định: <out>/backend_eval_results.json)")
-    ap.add_argument("--mean", default=None,
-                     help="mean normalize, 3 số cách nhau dấu phẩy, VD: 0.485,0.456,0.406 "
-                          "(PHẢI khớp train.yaml -> normalize.mean, mặc định ImageNet nếu bỏ trống)")
-    ap.add_argument("--std", default=None,
-                     help="std normalize, 3 số cách nhau dấu phẩy, VD: 0.229,0.224,0.225 "
-                          "(PHẢI khớp train.yaml -> normalize.std, mặc định ImageNet nếu bỏ trống)")
+    ap.add_argument("--mean", default=None)
+    ap.add_argument("--std", default=None)
+    ap.add_argument("--keep-intermediate", action="store_true",
+                     help="Giữ lại saved_model/ + file tạm (debug), mặc định luôn dọn sạch")
     args = ap.parse_args()
 
     mean = _parse_mean_std(args.mean, DEFAULT_MEAN)
@@ -439,6 +482,7 @@ def _cli() -> None:
         n_calib=args.n_calib,
         mean=mean,
         std=std,
+        keep_intermediate=args.keep_intermediate,
     )
 
     if args.test_dir:

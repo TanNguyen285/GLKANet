@@ -1,0 +1,57 @@
+# ============================================================
+# configs/train_proxy.yaml — Proxy config để thử nghiệm kiến trúc nhanh
+# Dùng: model.train("configs/train_proxy.yaml")
+# Mục đích: so sánh RANKING giữa các biến thể kiến trúc, KHÔNG dùng để báo cáo accuracy cuối
+# ============================================================
+
+model_yaml: Hybird.yaml
+data:       dataset_proxy.yaml   # ← file mới, trỏ tới subset raw đã lấy mẫu
+
+img_size: 224
+
+normalize:
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+augment:
+  crop_scale: [0.7, 1.0]
+  flip_h:     0.5
+  flip_v:     0.3
+  color_jitter:
+    brightness: 0.3
+    contrast:   0.3
+    saturation: 0.2
+    hue:        0.05
+
+train:
+  epochs:     18          # ← giảm từ 150 xuống 18 (~1/8), giữ nguyên loại scheduler
+  batch_size: 64          # giữ nguyên, không đổi thêm biến số
+  seed:       42           # ← BẮT BUỘC giữ giống hệt seed full, để subset sampling tái lập được
+  val_ratio:  0.1
+  test_ratio: 0
+  handle_imbalance: true
+  label_smoothing:  0.0
+
+  optimizer:
+    type:         SGD
+    lr:           0.01     # giữ nguyên peak LR
+    momentum:     0.9
+    weight_decay: 0.0005
+    nesterov:     true
+
+  scheduler:
+    type:    CosineAnnealingLR
+    eta_min: 0.000001       # cosine vẫn chạy hết chu kỳ nhưng trong 18 epoch thay vì 150
+
+hardware:
+  device:      cuda
+  num_workers: 8
+  pin_memory:  true
+
+logging:
+  runs_dir:      runs_proxy   # ← tách thư mục riêng, tránh lẫn với run chính thức
+  tsne_interval: 5             # giảm interval vì tổng epoch ít
+  eval_test:     true
+
+export:
+  enabled: false          # ← tắt export TFLite ở proxy, không cần export mỗi lần thử kiến trúc

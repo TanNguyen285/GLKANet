@@ -1,124 +1,128 @@
-Ý bạn là muốn **một file duy nhất** chứa toàn bộ nội dung của file `README.md` để bạn chỉ cần copy một phát là xong đúng không?
-
-Dưới đây là toàn bộ nội dung file mã nguồn Markdown, bạn chỉ cần bấm nút **Copy** ở góc block code này rồi paste đè vào file `README.md` của mình là chuẩn bài:
 
 ```markdown
-# ⚡ GLKAnet: Lightweight Image Classification Library
+# Simple_GLKA
 
-Lightweight image classification library (YOLOv8-style) — copy thư mục `glkanet/` vào project là dùng được.
+Repo này dùng để train, đánh giá và export mô hình phân loại ảnh theo kiến trúc GLKA. Mục tiêu là chạy được từ đầu đến cuối với cấu hình YAML, sau đó xuất ra file deploy và TFLite.
 
----
+## 1. Cài đặt ban đầu
 
-## 📂 Cấu trúc project
+Cài các package cần thiết trước khi chạy:
 
-```text
-your_project/
-├── glkanet/               # 📦 Thư viện (copy vào đây)
-├── simple_glka.yaml       # 🏗️ Kiến trúc model (YOLO-style)
-└── glkanet/configs/       # ⚙️ Thư mục chứa cấu hình
-    ├── dataset.yaml       # 🖼️ Cấu hình dataset
-    └── train.yaml         # 🚀 Cấu hình siêu tham số (hyperparams)
-
+```bash
+pip install torch torchvision pyyaml numpy pillow scikit-learn matplotlib seaborn onnx onnxscript
 ```
 
----
+Nếu cần export sang TFLite, cài thêm bộ thư viện trong thư mục TFlite:
 
-## 🚀 Quickstart
+```bash
+pip install -r TFlite/requirements-tflite.txt
+```
 
-### 🐍 Python API (`train.py`)
+## 2. Chuẩn bị dữ liệu
+
+Đặt dataset theo cấu trúc thư mục chuẩn hoặc dùng cấu trúc CCMT-style. File cấu hình dữ liệu nằm ở:
+
+- glkanet/configs/dataset.yaml
+
+Ví dụ ngắn:
+
+```yaml
+path: C:/path/to/your/dataset
+train: train_set
+test: test_set
+```
+
+## 3. Chỉnh cấu hình train
+
+File cấu hình chính nằm ở:
+
+- glkanet/configs/train.yaml
+
+Bạn có thể chỉnh các mục chính như:
+
+- epochs, batch_size, learning rate
+- device: cuda hoặc cpu
+- đường dẫn dataset
+- export: bật/tắt export ONNX/TFLite
+
+Lưu ý trên Windows nếu gặp lỗi multiprocessing thì đổi `num_workers` xuống `0`.
+
+## 4. Chạy train
+
+Từ thư mục gốc của repo, có thể chạy nhanh như sau:
+
+```bash
+python -m glkanet train --cfg glkanet/configs/train.yaml
+```
+
+Hoặc dùng script Python sẵn:
+
+```bash
+python GLKAnet.py
+```
+
+Ví dụ dùng Python API:
 
 ```python
 from glkanet import GLKA
 
-def main():
-    # 1. Khởi tạo mô hình
-    model = GLKA("simple_glka.yaml")
-
-    print("--- Bắt đầu huấn luyện ---")
-    
-    # 2. Train mô hình sử dụng cấu hình YAML
-    model.train("glkanet/configs/train.yaml")
-    
-    # Ghi đè tham số nhanh nếu cần (không bắt buộc)
-    # model.train("glkanet/configs/train.yaml", epochs=50, device="cuda", lr=0.005)
-    
-    print("--- Huấn luyện xong! Tự động xuất mô hình ---")
-    
-    # 3. Xuất ra các phiên bản deploy
-    model.export()
-
-    # --- Các hàm bổ trợ khác ---
-    # Load checkpoint: model = GLKA.from_checkpoint("runs/exp1/weights/best_train.pt", "simple_glka.yaml")
-    # Đánh giá:        model.val("glkanet/configs/train.yaml", split="test")
-    # Dự đoán:         indices, names = model.predict(["img1.jpg", "img2.jpg"])
-    
-if __name__ == "__main__":
-    main()
-
+model = GLKA("glkanet/configs/shuffle_glkav2.yaml")
+model.train("glkanet/configs/train.yaml")
+model.export()
 ```
 
-### 💻 CLI
+## 5. Kiểm tra / đánh giá
 
 ```bash
-# Train với cấu hình mặc định
-python -m glkanet train --cfg glkanet/configs/train.yaml
-
-# Train kèm ghi đè tham số nhanh
-python -m glkanet train --cfg glkanet/configs/train.yaml --epochs 50 --device cuda
-
-# Đánh giá mô hình trên tập test
-python -m glkanet val   --cfg glkanet/configs/train.yaml --split test
-
-# Export mô hình thủ công từ file weights
-python -m glkanet export --weights runs/exp1/weights/best_train.pt --model simple_glka.yaml
-
-# Xem thông tin cấu hình hệ thống
-python -m glkanet info   --cfg glkanet/configs/train.yaml --model simple_glka.yaml
-
+python -m glkanet val --cfg glkanet/configs/train.yaml --split test
 ```
 
----
+## 6. Export sang ONNX / TFLite
 
-## 📊 Output sau train
+Sau khi train xong, repo sẽ tự động export các file ở thư mục `runs/expX/weights/`.
 
-Toàn bộ kết quả, đồ thị và file weights sẽ tự động xuất ra trong thư mục `runs/expX/`:
+Export thủ công:
+
+```bash
+python -m glkanet export --weights runs/exp1/weights/best_train.pt --model glkanet/configs/shuffle_glkav2.yaml
+```
+
+Đối với TFLite, repo đã có script riêng ở thư mục TFlite. Trên Windows có thể dùng:
+
+```bash
+TFlite\setup_and_run.bat --onnx runs\exp1\weights\best_deploy.onnx --out runs\exp1\weights\tflite --input-size 224 --mode all
+```
+
+## 7. Kết quả sau khi chạy
+
+Kết quả sẽ được lưu trong thư mục `runs/expX/` gồm:
+
+- weights: checkpoint và file deploy
+- báo cáo huấn luyện và confusion matrix
+- đồ thị loss/accuracy
+
+Ví dụ cấu trúc cơ bản:
 
 ```text
 runs/exp1/
 ├── weights/
-│   ├── best_f1.pt            🔥 Checkpoint tốt nhất theo F1-score
-│   ├── best_loss.pt          📉 Checkpoint tốt nhất theo Loss
-│   ├── best_train.pt         📦 Checkpoint gốc chưa reparam
-│   ├── best_deploy.pt        🚀 Checkpoint đã reparam (tối ưu inference)
-│   └── best_deploy.onnx      🌐 Mô hình ONNX (Opset 18)
-├── training_curves.png       📈 Đồ thị Loss và Accuracy qua từng epoch
-├── cm_val_best_f1.png        🧩 Ma trận nhầm lẫn (Confusion Matrix) tập Val
-├── cm_test.png               🧩 Ma trận nhầm lẫn tập Test
-├── tsne_test.png             🎨 Biểu đồ phân cụm đặc trưng t-SNE
-├── epoch_reports.txt         📝 Nhật ký chi tiết của từng epoch
-├── report_val_best_f1.txt    📋 Báo cáo chỉ số chi tiết tập Val
-└── report_test.txt           📋 Báo cáo chỉ số chi tiết tập Test
-
+├── epoch_reports.txt
+├── report_val_best_f1.txt
+├── report_test.txt
+└── training_curves.png
 ```
 
----
-
-## 🛠️ Requirements
+## 8. Cấu trúc thư mục chính
 
 ```text
-torch >= 2.1
-torchvision
-pyyaml
-numpy
-pillow
-scikit-learn
-matplotlib
-seaborn
-onnx
-onnxscript
-
+Simple_GLKA/
+├── glkanet/              # code chính: model, trainer, exporter
+├── glkanet/configs/      # file YAML cho model/data/train
+├── runs/                 # output training và evaluation
+├── TFlite/               # script export sang TFLite
+├── GLKAnet.py            # entrypoint train nhanh
+└── README.md             # hướng dẫn dùng repo
 ```
-
-```
+Nếu bạn muốn dùng repo này cho dataset riêng, chỉ cần sửa 2 file config: dataset.yaml và train.yaml là đã có thể chạy được.
 
 ```

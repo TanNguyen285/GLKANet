@@ -3,7 +3,7 @@
 # Dùng: model.train("configs/train.yaml")
 # ============================================================
 
-model_yaml: shuffle_glkav1.yaml      # relative so với file này hoặc absolute
+model_yaml: Hybird.yaml      # relative so với file này hoặc absolute
 data:       dataset.yaml  # relative so với project root
 
 img_size: 224
@@ -23,7 +23,7 @@ augment:
     hue:        0.05
 
 train:
-  epochs:     2
+  epochs:     150
   batch_size: 64
   seed:       42
   val_ratio:  0.1       # dùng khi không có val: trong dataset.yaml -> tự tách từ train_set
@@ -56,12 +56,8 @@ export:
   enabled: true
   opset:   18
   export_tflite: true
-  tflite_mode:   all          # fp32 | fp16 | int8 | all
+  tflite_mode:   all
   n_calib:       200
-
-  # Thư mục ImageFolder test THẬT, đã tách vật lý bằng scripts/split_ccmt_to_disk.py.
-  # Dùng luôn để: (1) calibrate int8, (2) eval accuracy ONNX/TFLite so sánh với PyTorch.
   test_dir: "C:/Users/ThisPC/Desktop/Raw Data/CCMT Dataset/test_set"
-
-  # Path tới thư mục chứa environment.py + onnx_to_tflite.py + venv-tflite
   tflite_project_dir: "C:/Users/ThisPC/Documents/GitHub/Simple_GLKA/TFlite"
+  dataset_yaml: "glkanet/configs/dataset.yaml"    # ← dòng mới thêm

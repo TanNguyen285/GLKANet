@@ -1,3 +1,4 @@
+# glkanet/blocks/glka_CA_SE.py — ĐÃ SỬA: thêm out_channels để đồng bộ API với GLKA_Shuffle
 from __future__ import annotations
 import torch
 import torch.nn as nn
@@ -16,17 +17,31 @@ GLKA_PRESETS: dict[int, list[tuple[int, int]]] = {
 
 
 class GLKA_CA_SE(nn.Module):
+    """
+    anchor     = DWConv_5x5(x)
+    branch_sum = Σ dilated_branches(anchor)   # spatial trước, KHÔNG activation
+    out        = SE(branch_sum)                 # channel gate áp SAU (SE tự có sigmoid bên trong)
+    return out_proj(out)                          # 1x1 conv + BN, đổi dim -> out_channels
+
+    ĐÃ SỬA so với bản gốc: thêm out_channels + out_proj để tự đổi số kênh,
+    đồng bộ API với GLKA_Shuffle (dim, out_channels, K, stride, se_reduction).
+    Trước đây class này chỉ nhận `dim` và output luôn giữ nguyên `dim` kênh,
+    khiến EfficientBlock gọi glka_cls(..., out_channels=out_channels, ...)
+    bị TypeError vì thiếu tham số này.
+    """
 
     def __init__(
         self,
         dim:             int,
+        out_channels:    int,          # MỚI
         K:               int = 13,
         stride:          int = 1,
         branches_config: list | None = None,
         se_reduction:    int = 8,      # bản gốc dùng //8, mặc định lại theo đó
     ):
         super().__init__()
-        self.dim    = dim
+        self.dim          = dim
+        self.out_channels = out_channels   # MỚI
         self.K      = K
         self.stride = stride
 
@@ -58,11 +73,20 @@ class GLKA_CA_SE(nn.Module):
             ))
 
         # se_reduction <= 0 -> tắt hẳn SE (self.se = None). Không dùng
-        # nn.Identity() vì forward sẽ nhân "branch_sum * self.se(branch_sum)",
-        # với Identity thì thành branch_sum**2 (sai công thức).
+        # nn.Identity() vì forward sẽ trả thẳng "branch_sum" mà không có
+        # activation nào — vẫn hợp lệ (SE tắt = chỉ còn spatial-only path).
         self.se = SEBlock(dim, reduction=se_reduction) if se_reduction > 0 else None
 
+        # MỚI: projection cuối để đổi dim -> out_channels, giống vai trò
+        # self.fuse trong GLKA_Shuffle. Luôn tạo (kể cả khi dim==out_channels)
+        # để nhất quán cấu trúc và fold BN được đồng bộ ở switch_to_deploy().
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(dim, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+
         self.reparam_conv: nn.Conv2d | None = None
+        self._deployed = False   # MỚI: guard tường minh, đồng bộ với GLKA_Shuffle/GLKA_CBAM
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         anchor = self.conv0(x)
@@ -73,29 +97,42 @@ class GLKA_CA_SE(nn.Module):
             branch_sum = sum(b(anchor) for b in self.branches)
 
         # SEBlock đã tự nhân gating bên trong, chỉ gọi thẳng self.se(...).
-        return self.se(branch_sum) if self.se is not None else branch_sum
+        out = self.se(branch_sum) if self.se is not None else branch_sum
+        return self.out_proj(out)   # MỚI
 
     def switch_to_deploy(self) -> None:
-        if not hasattr(self, "branches"):
+        if self._deployed:          # MỚI: guard tường minh
             return
 
-        W_equiv = 0
-        B_equiv = 0
-        for branch, (k_size, dil) in zip(self.branches, self.branches_config):
-            w_fused, b_fused = self._fuse_bn(branch)
-            W_equiv += self._to_target_k(w_fused, orig_k=k_size, d=dil)
-            B_equiv += b_fused
+        if hasattr(self, "branches"):
+            W_equiv = 0
+            B_equiv = 0
+            for branch, (k_size, dil) in zip(self.branches, self.branches_config):
+                w_fused, b_fused = self._fuse_bn(branch)
+                W_equiv += self._to_target_k(w_fused, orig_k=k_size, d=dil)
+                B_equiv += b_fused
 
-        self.reparam_conv = nn.Conv2d(
-            self.dim, self.dim, self.K,
-            padding=self.K // 2,
-            groups=self.dim,
-            bias=True,
-        )
-        self.reparam_conv.weight.data = W_equiv
-        self.reparam_conv.bias.data   = B_equiv
+            self.reparam_conv = nn.Conv2d(
+                self.dim, self.dim, self.K,
+                padding=self.K // 2,
+                groups=self.dim,
+                bias=True,
+            )
+            self.reparam_conv.weight.data = W_equiv
+            self.reparam_conv.bias.data   = B_equiv
 
-        del self.branches
+            del self.branches
+
+        # MỚI: fold BN vào out_proj (giống hệt cách self.fuse được fold
+        # trong GLKA_Shuffle — ở đây không có groups=2/shuffle nên fold
+        # thẳng, không có vấn đề cross-group permutation).
+        w_out, b_out = self._fuse_bn(self.out_proj)
+        new_out_proj = nn.Conv2d(self.dim, self.out_channels, kernel_size=1, bias=True)
+        new_out_proj.weight.data = w_out
+        new_out_proj.bias.data   = b_out
+        self.out_proj = new_out_proj
+
+        self._deployed = True   # MỚI
 
     def _fuse_bn(self, block: nn.Sequential):
         conv: nn.Conv2d      = block[0]
@@ -120,6 +157,7 @@ class GLKA_CA_SE(nn.Module):
     def __repr__(self) -> str:
         se_info = "off" if self.se is None else f"dim//{self.se.se[1].out_channels}"
         return (
-            f"GLKA_CA_SE(dim={self.dim}, K={self.K}, stride={self.stride}, "
+            f"GLKA_CA_SE(dim={self.dim}, out_channels={self.out_channels}, "
+            f"K={self.K}, stride={self.stride}, "
             f"branches={self.branches_config}, SE={se_info})"
         )

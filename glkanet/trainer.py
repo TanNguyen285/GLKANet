@@ -20,8 +20,9 @@ TỐI ƯU so với bản gốc (không đổi logic train/eval/checkpoint):
      chừng vẫn biết exp đó đang chạy kiến trúc nào, tiện khi test nhiều
      cấu trúc model khác nhau.
   8. export_all() được truyền thêm calib_loader/test_loader/export_tflite/
-     n_calib — để tự động export TFLite int8 và tự chạy so sánh accuracy
-     3 backend (PyTorch/ONNX/TFLite) ngay sau khi train xong.
+     n_calib/dataset_yaml — để tự động export TFLite int8, tự chạy so sánh
+     accuracy 3 backend (PyTorch/ONNX/TFLite), và tự benchmark latency/FPS
+     thật trên toàn bộ test_set (bench_dataset.py) ngay sau khi train xong.
 """
 
 from __future__ import annotations
@@ -55,12 +56,6 @@ def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # deterministic=True + benchmark=False ép cudnn chọn algorithm chậm
-    # nhưng ổn định bit-for-bit. Đổi sang benchmark=True để cudnn tự
-    # profile và chọn kernel nhanh nhất cho shape input cố định của bạn
-    # (ảnh 224x224 cố định → benchmark rất hiệu quả, an toàn cho training
-    # thông thường, chỉ ảnh hưởng reproducibility tuyệt đối giữa các lần
-    # chạy, không ảnh hưởng tính đúng đắn).
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark     = True
 
@@ -211,7 +206,7 @@ class Trainer:
         self.exp_cfg  = cfg.get("export",  {})
         self.tflite_project_dir = self.exp_cfg.get("tflite_project_dir", "TFlite")
         self.test_dir           = self.exp_cfg.get("test_dir", None)
-    
+
 
         norm_cfg = cfg.get("normalize", {})
         self.norm_mean = tuple(norm_cfg.get("mean", [0.485, 0.456, 0.406]))
@@ -242,18 +237,9 @@ class Trainer:
         self.start_epoch = 0
 
         # ── Resume ──────────────────────────────────────────────────
-        # PHẢI load state TRƯỚC torch.compile: compile wrap model lại
-        # (thêm prefix "_orig_mod." vào key state_dict), load checkpoint
-        # cũ (key không có prefix) sau compile sẽ lỗi mismatch.
         if resume_ckpt is not None:
             self._resume(resume_ckpt)
 
-        # torch.compile fuse nhiều kernel nhỏ (depthwise conv, BN, branches
-        # trong GLKA) thành ít kernel lớn hơn → giảm mạnh overhead launch.
-        # LƯU Ý: torch.compile cần Triton, mà Triton KHÔNG hỗ trợ tốt trên
-        # Windows native (chỉ official trên Linux/WSL) → mặc định TẮT trên
-        # Windows để tránh crash. Muốn dùng trên Windows: cài triton-windows
-        # (pip install triton-windows) rồi set hardware.compile: true.
         is_windows = platform.system() == "Windows"
         self.use_compile = hw_cfg.get("compile", not is_windows) and self.device.type == "cuda"
         if self.use_compile:
@@ -283,12 +269,8 @@ class Trainer:
 
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
-        # model weights (bắt buộc phải có)
         self.model.load_state_dict(ckpt["state_dict"])
 
-        # optimizer state (momentum SGD / moment AdamW) — nếu thiếu vẫn
-        # chạy được nhưng momentum sẽ reset, LR nhảy về giá trị khởi tạo
-        # cho tới khi scheduler catch up.
         if "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         else:
@@ -296,22 +278,17 @@ class Trainer:
                   "(checkpoint cũ trước khi có resume) — chỉ resume weights, "
                   "momentum/LR sẽ khởi tạo lại từ đầu")
 
-        # scheduler state (vị trí hiện tại trên cosine curve)
         if "scheduler" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler"])
         else:
             print("  [trainer] ⚠ checkpoint không có scheduler state — "
                   "LR sẽ tính lại từ epoch 0 theo T_max mới")
 
-        # AMP grad scaler state
         if "scaler" in ckpt and self.use_amp:
             self.scaler.load_state_dict(ckpt["scaler"])
 
-        # epoch đã train xong -> tiếp tục từ epoch kế tiếp
         self.start_epoch = ckpt.get("epoch", -1) + 1
 
-        # best metrics đã đạt được -> không bị ghi đè bởi giá trị tệ hơn
-        # ngay ở epoch đầu tiên sau resume
         self.best_f1   = ckpt.get("best_f1",   ckpt.get("val_f1",   0.0))
         self.best_loss = ckpt.get("best_loss", ckpt.get("val_loss", float("inf")))
 
@@ -355,16 +332,17 @@ class Trainer:
 
         Args:
             train_loader, val_loader, test_loader: DataLoader tương ứng.
-            model_yaml:  (hiện chưa dùng riêng — xem cfg_path) đường dẫn
-                         yaml kiến trúc model, nếu bạn tách riêng khỏi
-                         cfg_path thì cần tự bổ sung logic dùng biến này.
+            model_yaml:  đường dẫn yaml kiến trúc model.
             cfg_path:    đường dẫn yaml kiến trúc model — được copy vào
-                         weights/ NGAY LÚC BẮT ĐẦU TRAIN (không đợi tới
-                         cuối), và cũng được dùng lại trong export_all()
-                         để đóng gói cùng checkpoint.
-            data_yaml:   (hiện chưa dùng riêng) đường dẫn yaml cấu hình
-                         dataset, nếu cần lưu lại thì tự bổ sung tương tự
-                         cfg_path.
+                         weights/ NGAY LÚC BẮT ĐẦU TRAIN, và dùng lại
+                         trong export_all() để đóng gói cùng checkpoint.
+            data_yaml:   đường dẫn dataset.yaml (path/train/test) — được
+                         truyền thẳng xuống export_all() làm dataset_yaml
+                         để tự động chạy bench_dataset.py (benchmark
+                         latency/FPS/accuracy thật trên toàn bộ test_set)
+                         sau khi export TFLite xong. Nếu không truyền, sẽ
+                         thử lấy từ cfg["export"]["dataset_yaml"] trong
+                         yaml cấu hình train.
         """
         total_params = sum(p.numel() for p in self.model.parameters()) / 1e6
         write_train_header(
@@ -385,7 +363,6 @@ class Trainer:
             lr_curr = self.optimizer.param_groups[0]['lr']
 
             self.model.train()
-            # Tích lũy loss trên GPU dạng tensor, tránh .item() mỗi step
             train_loss_sum = torch.zeros(1, device=self.device)
             n_seen = 0
 
@@ -414,13 +391,9 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
-                # Tích lũy không sync (loss.detach() vẫn nằm trên GPU)
                 train_loss_sum += loss.detach() * imgs.size(0)
                 n_seen += imgs.size(0)
 
-                # Chỉ đồng bộ (đọc giá trị về CPU) mỗi log_every step
-                # hoặc ở step cuối cùng để cập nhật progress bar — giảm
-                # mạnh số lần CPU phải đợi GPU so với bản gốc (mỗi step).
                 if (i % log_every == 0) or (i == len(train_loader) - 1):
                     cur_loss = loss.item()
                     pbar.set_postfix(lr=f"{lr_curr:.2e}", loss=f"{cur_loss:.4f}")
@@ -450,13 +423,11 @@ class Trainer:
                 train_loss=train_loss, val_loss=val_loss, val_f1=val_f1,
             )
 
-            # ── Checkpoint: last (luôn ghi đè mỗi epoch — dùng để resume) ──
             self._save_ckpt(
                 "last.pt", epoch,
                 val_f1=val_f1, val_loss=val_loss, val_acc=val_acc,
             )
 
-            # ── Checkpoint: best F1 ──
             if val_f1 > self.best_f1:
                 self.best_f1 = val_f1
                 self._save_ckpt("best_f1.pt", epoch, val_f1=val_f1, val_acc=val_acc)
@@ -475,7 +446,6 @@ class Trainer:
                         self.save_dir, f"val_ep{epoch+1}",
                     )
 
-            # ── Checkpoint: best loss ──
             if val_loss < self.best_loss:
                 self.best_loss = val_loss
                 self._save_ckpt("best_loss.pt", epoch, val_loss=val_loss)
@@ -523,6 +493,7 @@ class Trainer:
                 verbose       = True,
                 export_tflite = self.exp_cfg.get("export_tflite", True),
                 test_dir      = self.test_dir,
+                dataset_yaml  = data_yaml or self.exp_cfg.get("dataset_yaml"),
                 class_names   = self.class_names,
                 tflite_project_dir = self.tflite_project_dir,
                 tflite_mode   = self.exp_cfg.get("tflite_mode", "all"),

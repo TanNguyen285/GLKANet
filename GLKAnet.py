@@ -1,16 +1,11 @@
 from glkanet import GLKA
 
 def main():
-    # 1. Khởi tạo mô hình dựa trên file kiến trúc ở thư mục gốc
-    model = GLKA("glkanet/configs/shuffle_glkav2.yaml")
+    model = GLKA("glkanet/configs/Hybird.yaml")
 
     print("--- Bắt đầu huấn luyện theo cấu hình từ YAML ---")
-    
-    # 2. Sửa lại đường dẫn: trỏ thẳng vào trong thư mục glkanet/configs/
     model.train("glkanet/configs/train.yaml")
-    
-    print("--- Huấn luyện xong! Tự động export mô hình ---")
-    model.export()
+    print("--- Huấn luyện xong! Mô hình đã được export tự động trong quá trình train ---")
 
 if __name__ == "__main__":
     main()
