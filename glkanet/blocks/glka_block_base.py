@@ -13,16 +13,20 @@ GLKA_PRESETS: dict[int, list[tuple[int, int]]] = {
 class GLKA_CBAM(nn.Module):
     """
     Conv_Nor (KxK, DW) -> anchor
-    anchor * SE(anchor) -> anchor_se
+    anchor * SE(anchor) -> anchor_se     (SE bị tắt hẳn nếu se_reduction=0 -> không
+                                           tạo self.se, không tốn compute/param nào)
     anchor_se -> Spatial (sum các nhánh dilated, tổng hợp field KxK) -> sigmoid -> spatial_gate
     anchor_se * spatial_gate -> output
+
+    se_reduction=0  -> KHÔNG dùng SE, anchor_se = anchor (bỏ hẳn nhánh channel gate)
+    se_reduction>0  -> dùng SE với hidden = max(1, dim // se_reduction)
     """
     def __init__(
         self,
         dim:             int,
         K:               int = 13,
         stride:          int = 1,
-        conv0_k:         int = 5,   # kernel size của Conv_Nor tạo anchor (theo sơ đồ: 3x3 hoặc 5x5)
+        conv0_k:         int = 5,
         branches_config: list | None = None,
         se_reduction:    int = 4,
     ):
@@ -47,15 +51,21 @@ class GLKA_CBAM(nn.Module):
             nn.ReLU6(inplace=True),
         )
 
-        # 2) SE (Channel Attention) — áp dụng SAU conv0, lên chính anchor
-        hidden = max(1, dim // se_reduction)
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, hidden, 1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, dim, 1, bias=True),
-            nn.Sigmoid(),
-        )
+        # 2) SE (Channel Attention) — áp dụng SAU conv0, lên chính anchor.
+        #    se_reduction=0 -> KHÔNG tạo self.se, forward() tự bỏ qua nhánh này
+        #    (dùng hasattr thay vì cờ bool riêng -> không còn 2 nguồn sự thật).
+        self.use_se = se_reduction > 0
+        self.last_gate = None  # cache (B,C,1,1) cho loss bank đọc lại nếu cần
+
+        if self.use_se:
+            hidden = max(1, dim // se_reduction)
+            self.se = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(dim, hidden, 1, bias=True),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden, dim, 1, bias=True),
+                nn.Sigmoid(),
+            )
 
         # 3) Spatial: các nhánh Dilated (tổng hợp thành field lớn KxK), input là anchor_se
         self.branches = nn.ModuleList()
@@ -74,20 +84,29 @@ class GLKA_CBAM(nn.Module):
         # Bước 1: Conv_Nor -> anchor
         anchor = self.conv0(x)
 
-        # Bước 2: SE nhân trực tiếp lên anchor
-        se_gate   = self.se(anchor)
-        anchor_se = anchor * se_gate
+        # Bước 2: SE nhân lên anchor (bỏ qua nếu se_reduction=0 hoặc đã strip)
+        if self.use_se and hasattr(self, "se"):
+            self.last_gate = self.se(anchor)
+            anchor_se = anchor * self.last_gate
+        else:
+            self.last_gate = None
+            anchor_se = anchor
 
         # Bước 3: Spatial attention từ anchor_se
         if self.reparam_conv is not None:
             spatial_gate = self.reparam_conv(anchor_se)
         else:
-            branch_outs = [branch(anchor_se) for branch in self.branches]
-            spatial_gate = torch.stack(branch_outs, dim=0).sum(dim=0)
+            spatial_gate = sum(branch(anchor_se) for branch in self.branches)
         spatial_gate = self.spatial_gate_act(spatial_gate)
 
         # Bước 4: Nhân lần cuối
         return anchor_se * spatial_gate
+
+    def strip_se(self) -> None:
+        """Xoá hẳn nhánh SE — gọi lúc deploy, sau khi train xong (tiết kiệm compute vĩnh viễn)."""
+        self.use_se = False
+        if hasattr(self, "se"):
+            del self.se
 
     def switch_to_deploy(self) -> None:
         if self._deployed:
@@ -144,5 +163,5 @@ class GLKA_CBAM(nn.Module):
     def __repr__(self) -> str:
         return (
             f"GLKA_CBAM(dim={self.dim}, conv0_k={self.conv0_k}, K={self.K}, "
-            f"stride={self.stride}, branches={self.branches_config})"
+            f"stride={self.stride}, branches={self.branches_config}, use_se={self.use_se})"
         )

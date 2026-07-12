@@ -1,0 +1,34 @@
+Hybird_No_residual
+Accuracy    : 0.8835
+F1 macro    : 0.8686
+F1 weighted : 0.8828
+
+                           precision    recall  f1-score   support
+
+       Cashew_anthracnose     0.9581    0.9275    0.9426       345
+           Cashew_gumosis     0.9868    0.9615    0.9740        78
+           Cashew_healthy     0.9571    0.9817    0.9693       273
+        Cashew_leaf miner     0.9489    0.9455    0.9472       275
+          Cashew_red rust     0.9738    0.9940    0.9838       336
+ Cassava_bacterial blight     0.9136    0.9119    0.9128       522
+       Cassava_brown spot     0.8935    0.9358    0.9142       296
+       Cassava_green mite     0.9212    0.9212    0.9212       203
+          Cassava_healthy     0.9784    0.9496    0.9638       238
+           Cassava_mosaic     0.9544    0.9544    0.9544       241
+      Maize_fall armyworm     0.8462    0.7719    0.8073        57
+         Maize_grasshoper     0.9308    0.9030    0.9167       134
+            Maize_healthy     0.7692    0.7500    0.7595        40
+        Maize_leaf beetle     0.9572    0.9572    0.9572       187
+        Maize_leaf blight     0.7500    0.7310    0.7404       197
+          Maize_leaf spot     0.7026    0.7652    0.7326       247
+       Maize_streak virus     0.8689    0.8196    0.8435       194
+           Tomato_healthy     0.9100    0.9891    0.9479        92
+       Tomato_leaf blight     0.7478    0.6667    0.7049       258
+         Tomato_leaf curl     0.7927    0.6436    0.7104       101
+Tomato_septoria leaf spot     0.8223    0.8869    0.8534       548
+  Tomato_verticulium wilt     0.6667    0.6405    0.6533       153
+
+                 accuracy                         0.8835      5015
+                macro avg     0.8750    0.8640    0.8686      5015
+             weighted avg     0.8834    0.8835    0.8828      5015
+

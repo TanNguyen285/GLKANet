@@ -1,0 +1,24 @@
+﻿class,train,test,total
+Cashew_anthracnose,1384,345,1729
+Cashew_gumosis,314,78,392
+Cashew_healthy,1095,273,1368
+Cashew_leaf miner,1103,275,1378
+Cashew_red rust,1346,336,1682
+Cassava_bacterial blight,2092,522,2614
+Cassava_brown spot,1185,296,1481
+Cassava_green mite,812,203,1015
+Cassava_healthy,955,238,1193
+Cassava_mosaic,964,241,1205
+Maize_fall armyworm,228,57,285
+Maize_grasshoper,539,134,673
+Maize_healthy,165,40,205
+Maize_leaf beetle,751,187,938
+Maize_leaf blight,799,197,996
+Maize_leaf spot,1000,247,1247
+Maize_streak virus,778,194,972
+Tomato_healthy,375,92,467
+Tomato_leaf blight,1036,258,1294
+Tomato_leaf curl,412,101,513
+Tomato_septoria leaf spot,2195,548,2743
+Tomato_verticulium wilt,619,153,772
+TOTAL,20147,5015,25162

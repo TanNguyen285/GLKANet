@@ -1,28 +1,12 @@
 """glkanet/trainer.py — Train loop, optimizer, scheduler, evaluate.
 
-TỐI ƯU so với bản gốc (không đổi logic train/eval/checkpoint):
-  1. AMP (torch.cuda.amp) — giảm tải GPU compute + giảm bộ nhớ, cho phép
-     batch lớn hơn / nhanh hơn trên GPU hỗ trợ FP16/BF16.
-  2. .to(device, non_blocking=True) — khai thác đúng pin_memory=True
-     đã set trong dataloader.
-  3. Bỏ gọi loss.item() ngay trong vòng lặp để hiển thị progress bar mỗi
-     step (bản gốc gọi .item() 2 lần/step → 2 lần sync CPU-GPU/step).
-     Thay vào đó tích lũy loss dạng tensor trên GPU, chỉ .item() 1 lần
-     sau mỗi N step (giảm sync nhưng vẫn cập nhật progress bar mượt).
-  4. torch.backends.cudnn.benchmark = True khi không cần reproducibility
-     tuyệt đối (vẫn giữ set_seed, chỉ tắt deterministic gây chậm cudnn).
-  5. set_to_none=True khi zero_grad — nhanh hơn việc set về 0 toàn bộ tensor.
-  6. Resume training — checkpoint lưu cả optimizer/scheduler/scaler state,
-     không chỉ model weights, để tiếp tục train đúng từ chỗ dừng (LR,
-     momentum không bị reset về giá trị khởi tạo).
-  7. Copy yaml kiến trúc model ra weights/ NGAY LÚC BẮT ĐẦU TRAIN (không
-     đợi tới lúc export_all() ở cuối) — để nếu train bị dừng/crash giữa
-     chừng vẫn biết exp đó đang chạy kiến trúc nào, tiện khi test nhiều
-     cấu trúc model khác nhau.
-  8. export_all() được truyền thêm calib_loader/test_loader/export_tflite/
-     n_calib/dataset_yaml — để tự động export TFLite int8, tự chạy so sánh
-     accuracy 3 backend (PyTorch/ONNX/TFLite), và tự benchmark latency/FPS
-     thật trên toàn bộ test_set (bench_dataset.py) ngay sau khi train xong.
+Bản dọn dẹp:
+  - Bỏ hoàn toàn t-SNE (plot_tsne, tsne_interval, val_feats không còn dùng
+    để vẽ t-SNE nữa) — evaluate() vẫn trả về feats vì logger/exporter khác
+    có thể cần, nhưng trainer không plot t-SNE nữa.
+  - Giữ nguyên toàn bộ phần tối ưu AMP / channels_last / torch.compile /
+    resume checkpoint (optimizer, scheduler, scaler, hist, epoch) như bản
+    gốc — resume vẫn hoạt động đúng khi train bị đứt quãng.
 """
 
 from __future__ import annotations
@@ -41,7 +25,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 
 from glkanet.logger import (
-    plot_curves, plot_confusion_matrix, plot_tsne,
+    plot_curves, plot_confusion_matrix,
     save_report, write_train_header,
 )
 from glkanet.exporter import export_all
@@ -77,7 +61,7 @@ def create_save_dir(runs_base: str | Path) -> Path:
 
 
 # ──────────────────────────────────────────────────────────────
-# Optimizer + Scheduler factory (giữ nguyên)
+# Optimizer + Scheduler factory
 # ──────────────────────────────────────────────────────────────
 
 def build_optimizer(model: nn.Module, opt_cfg: dict) -> optim.Optimizer:
@@ -207,11 +191,10 @@ class Trainer:
         self.tflite_project_dir = self.exp_cfg.get("tflite_project_dir", "TFlite")
         self.test_dir           = self.exp_cfg.get("test_dir", None)
 
-
         norm_cfg = cfg.get("normalize", {})
         self.norm_mean = tuple(norm_cfg.get("mean", [0.485, 0.456, 0.406]))
         self.norm_std  = tuple(norm_cfg.get("std",  [0.229, 0.224, 0.225]))
-        # AMP chỉ có ý nghĩa trên CUDA; tắt tự động nếu chạy CPU
+
         self.use_amp = hw_cfg.get("amp", True) and self.device.type == "cuda"
         self.scaler  = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         self.amp_dtype = torch.float16
@@ -222,15 +205,13 @@ class Trainer:
         self.scheduler    = build_scheduler(
             self.optimizer, tr_cfg["scheduler"], self.epochs)
 
-        # channels_last là tối ưu QUAN TRỌNG cho depthwise/grouped conv
-        # (groups=dim trong GLKA) — cuDNN có kernel riêng tối ưu hơn nhiều
-        # cho conv depthwise khi tensor ở layout NHWC so với NCHW mặc định.
         self.use_channels_last = hw_cfg.get("channels_last", True) and self.device.type == "cuda"
         self.model.to(self.device)
         if self.use_channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
             print("  [trainer] channels_last bật — tối ưu depthwise/grouped conv (GLKA)")
 
+        # Khởi tạo mặc định
         self.hist       = dict(train_loss=[], val_loss=[], val_f1=[], val_acc=[])
         self.best_f1    = 0.0
         self.best_loss  = float("inf")
@@ -240,16 +221,16 @@ class Trainer:
         if resume_ckpt is not None:
             self._resume(resume_ckpt)
 
+        # torch.compile
         is_windows = platform.system() == "Windows"
         self.use_compile = hw_cfg.get("compile", not is_windows) and self.device.type == "cuda"
         if self.use_compile:
             try:
-                torch._dynamo.config.suppress_errors = True  # fallback về eager nếu compile lỗi giữa chừng
+                torch._dynamo.config.suppress_errors = True
                 self.model = torch.compile(self.model, mode="default")
-                print("  [trainer] torch.compile bật (mode=default) — "
-                      "epoch đầu sẽ chậm hơn do compile, các epoch sau nhanh hơn nhiều")
+                print("  [trainer] torch.compile bật")
             except Exception as e:
-                print(f"  [trainer] torch.compile thất bại, bỏ qua: {e}")
+                print(f"  [trainer] torch.compile thất bại: {e}")
                 self.use_compile = False
         else:
             reason = "Windows (Triton không hỗ trợ tốt)" if is_windows else "tắt qua config"
@@ -257,49 +238,44 @@ class Trainer:
 
         if self.use_amp:
             print("  [trainer] AMP (mixed precision) bật — fp16 trên CUDA")
-
         if resume_ckpt is not None:
             print(f"  [trainer] Resume: bắt đầu từ epoch {self.start_epoch + 1}/{self.epochs}")
 
-    # ── Resume helper ────────────────────────────────────────────
     def _resume(self, ckpt_path: str | Path) -> None:
         ckpt_path = Path(ckpt_path)
         if not ckpt_path.exists():
             raise FileNotFoundError(f"resume_ckpt không tồn tại: {ckpt_path}")
 
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-
         self.model.load_state_dict(ckpt["state_dict"])
 
         if "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
-        else:
-            print("  [trainer] ⚠ checkpoint không có optimizer state "
-                  "(checkpoint cũ trước khi có resume) — chỉ resume weights, "
-                  "momentum/LR sẽ khởi tạo lại từ đầu")
-
         if "scheduler" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler"])
-        else:
-            print("  [trainer] ⚠ checkpoint không có scheduler state — "
-                  "LR sẽ tính lại từ epoch 0 theo T_max mới")
-
-        if "scaler" in ckpt and self.use_amp:
+        if "scaler" in ckpt and self.use_amp and ckpt["scaler"] is not None:
             self.scaler.load_state_dict(ckpt["scaler"])
 
         self.start_epoch = ckpt.get("epoch", -1) + 1
-
         self.best_f1   = ckpt.get("best_f1",   ckpt.get("val_f1",   0.0))
         self.best_loss = ckpt.get("best_loss", ckpt.get("val_loss", float("inf")))
 
+        if "hist" in ckpt and ckpt["hist"]:
+            self.hist = ckpt["hist"]
+            print(f"  [trainer] Đã khôi phục lịch sử huấn luyện cũ ({len(self.hist['train_loss'])} epochs)")
+        else:
+            print("  [trainer] ⚠ Không tìm thấy lịch sử 'hist' trong checkpoint, biểu đồ curves sẽ tính lại từ đầu.")
+
         if self.start_epoch >= self.epochs:
-            print(f"  [trainer] ⚠ checkpoint đã ở epoch {self.start_epoch}, "
-                  f">= epochs cấu hình ({self.epochs}). Tăng train.epochs "
-                  f"trong yaml nếu muốn train thêm.")
+            print(
+                f"  [trainer] ⚠ Checkpoint đã ở epoch {self.start_epoch}, "
+                f">= epochs cấu hình ({self.epochs}). Sẽ không train thêm — "
+                f"nếu muốn train tiếp, tăng train.epochs trong yaml."
+            )
 
     # ── Copy yaml kiến trúc helper ───────────────────────────────
     def _copy_arch_yaml(self, model_yaml: str | Path | None) -> None:
-        """Copy file yaml kiến trúc model ra weights/ NGAY LÚC BẮT ĐẦU TRAIN."""
+        """Copy file yaml kiến trúc model ra weights/ ngay lúc bắt đầu train."""
         weights_dir = self.save_dir / "weights"
         weights_dir.mkdir(parents=True, exist_ok=True)
 
@@ -314,9 +290,12 @@ class Trainer:
             return
 
         dst = weights_dir / model_yaml.name
-        shutil.copy2(model_yaml, dst)
-        print(f"  [trainer] yaml kiến trúc → weights/{dst.name} "
-            f"(copy ngay lúc bắt đầu train, trước khi vào training loop)")
+        if dst.resolve() != model_yaml.resolve():
+            shutil.copy2(model_yaml, dst)
+            print(f"  [trainer] yaml kiến trúc → weights/{dst.name} "
+                f"(copy ngay lúc bắt đầu train, trước khi vào training loop)")
+        else:
+            print(f"  [trainer] yaml kiến trúc đã có sẵn tại weights/{dst.name} — bỏ qua copy.")
 
     # ── Run ───────────────────────────────────────────────────
     def run(
@@ -334,15 +313,13 @@ class Trainer:
             train_loader, val_loader, test_loader: DataLoader tương ứng.
             model_yaml:  đường dẫn yaml kiến trúc model.
             cfg_path:    đường dẫn yaml kiến trúc model — được copy vào
-                         weights/ NGAY LÚC BẮT ĐẦU TRAIN, và dùng lại
+                         weights/ ngay lúc bắt đầu train, và dùng lại
                          trong export_all() để đóng gói cùng checkpoint.
             data_yaml:   đường dẫn dataset.yaml (path/train/test) — được
                          truyền thẳng xuống export_all() làm dataset_yaml
-                         để tự động chạy bench_dataset.py (benchmark
-                         latency/FPS/accuracy thật trên toàn bộ test_set)
-                         sau khi export TFLite xong. Nếu không truyền, sẽ
-                         thử lấy từ cfg["export"]["dataset_yaml"] trong
-                         yaml cấu hình train.
+                         để tự động chạy bench_dataset.py sau khi export
+                         TFLite xong. Nếu không truyền, sẽ thử lấy từ
+                         cfg["export"]["dataset_yaml"] trong yaml train.
         """
         total_params = sum(p.numel() for p in self.model.parameters()) / 1e6
         write_train_header(
@@ -350,10 +327,9 @@ class Trainer:
             len(self.class_names), total_params, self.class_names,
         )
 
-        # ── Copy yaml kiến trúc NGAY TỪ ĐẦU, trước khi train ────────
+        # Copy yaml kiến trúc ngay từ đầu, trước khi train
         self._copy_arch_yaml(model_yaml)
 
-        tsne_interval = self.log_cfg.get("tsne_interval", 20)
         log_every = 10  # chỉ .item() loss mỗi N step để giảm sync GPU-CPU
 
         # ══════════════════════════════════════════════════════
@@ -401,7 +377,7 @@ class Trainer:
             train_loss = (train_loss_sum / n_seen).item()
 
             # ── Val ──
-            val_loss, val_preds, val_labels, val_feats = evaluate(
+            val_loss, val_preds, val_labels, _ = evaluate(
                 self.model, val_loader, self.criterion, self.device,
                 use_amp=self.use_amp, use_channels_last=self.use_channels_last,
             )
@@ -423,6 +399,9 @@ class Trainer:
                 train_loss=train_loss, val_loss=val_loss, val_f1=val_f1,
             )
 
+            # Luôn lưu last.pt sau mỗi epoch → nếu train bị đứt quãng
+            # (crash / tắt máy / Ctrl+C), chỉ cần resume_ckpt=last.pt là
+            # tiếp tục đúng từ epoch kế tiếp, không mất optimizer/scheduler/scaler.
             self._save_ckpt(
                 "last.pt", epoch,
                 val_f1=val_f1, val_loss=val_loss, val_acc=val_acc,
@@ -440,11 +419,6 @@ class Trainer:
                     val_preds, val_labels, self.class_names,
                     self.save_dir, tag="val_best_f1",
                 )
-                if tsne_interval > 0 and (epoch + 1) % tsne_interval == 0:
-                    plot_tsne(
-                        val_feats, val_labels, self.class_names,
-                        self.save_dir, f"val_ep{epoch+1}",
-                    )
 
             if val_loss < self.best_loss:
                 self.best_loss = val_loss
@@ -463,7 +437,7 @@ class Trainer:
         if self.log_cfg.get("eval_test", True) and test_loader is not None:
             print("\n[*] Test set evaluation (best_f1.pt)...")
             self._load_ckpt("best_f1.pt")
-            test_loss, test_preds, test_labels, test_feats = evaluate(
+            test_loss, test_preds, test_labels, _ = evaluate(
                 self.model, test_loader, self.criterion, self.device,
                 use_amp=self.use_amp, use_channels_last=self.use_channels_last,
             )
@@ -473,8 +447,6 @@ class Trainer:
             )
             plot_confusion_matrix(
                 test_preds, test_labels, self.class_names, self.save_dir, "test")
-            plot_tsne(
-                test_feats, test_labels, self.class_names, self.save_dir, "test")
             print(f"  acc={test_acc*100:.2f}%  f1={test_f1:.4f}")
 
         # ══════════════════════════════════════════════════════
@@ -524,6 +496,7 @@ class Trainer:
                 "scaler":     self.scaler.state_dict() if self.use_amp else None,
                 "best_f1":    self.best_f1,
                 "best_loss":  self.best_loss,
+                "hist":       self.hist,
                 **metrics,
             },
             self.save_dir / name,
@@ -536,3 +509,6 @@ class Trainer:
             weights_only=False,
         )
         self.model.load_state_dict(ckpt["state_dict"])
+        self.best_f1 = ckpt["best_f1"]
+        self.best_loss = ckpt["best_loss"]
+        self.hist = ckpt["hist"]

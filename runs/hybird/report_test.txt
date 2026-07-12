@@ -1,3 +1,4 @@
+Hybird
 Accuracy    : 0.8889
 F1 macro    : 0.8764
 F1 weighted : 0.8881

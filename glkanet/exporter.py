@@ -1,13 +1,3 @@
-"""glkanet/exporter.py — Export 3 bản: train / deploy / onnx, kèm validate reparam
-tự động + chạy test trên test set. TFLite (convert + eval accuracy ONNX/TFLite) được
-đẩy hoàn toàn sang subprocess venv-tflite (environment.py) để tránh xung đột môi trường
-torch <-> tensorflow/onnx2tf trong cùng 1 process.
-
-BẢN SỬA: thêm bước tự động gọi bench_dataset.py (đo latency/FPS/accuracy THẬT trên
-toàn bộ test_set, có warmup 100 lần + nghỉ giữa các model) ngay sau khi TFLite export
-xong, merge kết quả vào bảng tổng kết cuối cùng.
-"""
-
 from __future__ import annotations
 
 import copy
@@ -109,6 +99,72 @@ def _validate_onnx(
     return ok
 
 
+@torch.no_grad()
+def _validate_torchscript(
+    model_deploy: nn.Module,
+    ts_model,
+    input_size:  int,
+    atol:        float = 1e-3,
+    rtol:        float = 1e-3,
+    n_samples:   int   = 4,
+    verbose:     bool  = True,
+) -> bool:
+    """So sánh logits deploy gốc vs bản TorchScript trace — đảm bảo trace
+    không làm lệch kết quả (vd do control-flow bị đóng băng sai)."""
+    model_deploy.eval()
+    ts_model.eval()
+
+    dummy = torch.randn(n_samples, 3, input_size, input_size)
+
+    out_deploy = _get_logits(model_deploy(dummy))
+    out_ts     = _get_logits(ts_model(dummy))
+
+    max_abs_diff = (out_deploy - out_ts).abs().max().item()
+    ok = torch.allclose(out_deploy, out_ts, atol=atol, rtol=rtol)
+
+    if verbose:
+        status = "OK" if ok else "MISMATCH"
+        print(f"  [validate] deploy vs torchscript logits: max_abs_diff={max_abs_diff:.6f} -> {status}")
+        if not ok:
+            print("  [validate] CẢNH BÁO: TorchScript trace lệch so với deploy model gốc! "
+                  "Kiểm tra model có control-flow phụ thuộc dữ liệu không (if/else theo input).")
+
+    return ok
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Export TorchScript full — file .pt TỰ CHỨA TOÀN BỘ kiến trúc + weights
+# ═══════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def _export_torchscript(
+    model_deploy: nn.Module,
+    weights_dir:  Path,
+    input_size:   int,
+    verbose:      bool = True,
+):
+    model_deploy.eval()
+    dummy = torch.randn(1, 3, input_size, input_size)
+
+    traced = torch.jit.trace(model_deploy, dummy, strict=False)
+    traced = torch.jit.freeze(traced.eval())  # gộp constant, tối ưu thêm cho inference
+
+    path_ts = weights_dir / "best_deploy_full.pt"
+    traced.save(str(path_ts))
+
+    if verbose:
+        print(f"  [export] deploy_full (TorchScript, tự chứa kiến trúc) → {path_ts.name}")
+
+    return path_ts, traced
+
+
+def load_torchscript(weight_path: str | Path, device: str = "cpu"):
+
+    model = torch.jit.load(str(weight_path), map_location=device)
+    model.eval()
+    return model
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Eval torch trên test set (giữ trong process chính vì cần torch + DataLoader)
 # ═══════════════════════════════════════════════════════════════════════
@@ -144,15 +200,7 @@ def _run_tflite_pipeline(
     std:        tuple[float, float, float] = DEFAULT_STD,
     verbose:    bool = True,
 ) -> tuple[Path | None, dict]:
-    """Gọi environment.py (venv-tflite riêng) qua subprocess để:
-      1) convert ONNX -> TFLite (fp32/fp16/int8), dùng đúng mean/std lúc train để calibrate
-      2) eval accuracy ONNX + mọi .tflite trên test_dir thật, cùng mean/std đó
-    Không raise nếu lỗi — chỉ log cảnh báo, để không làm gãy pipeline train/export
-    ONNX vốn đã chạy xong ở bước trước.
-
-    Returns:
-        (tflite_dir hoặc None, backend_eval dict — rỗng nếu lỗi/không có test_dir)
-    """
+  
     tflite_dir = weights_dir / "tflite"
     tflite_dir.mkdir(parents=True, exist_ok=True)
 
@@ -216,16 +264,7 @@ def _run_bench_dataset(
     tflite_project_dir: str | Path,
     verbose: bool = True,
 ) -> dict:
-    """Gọi bench_dataset.py trong venv-tflite để đo latency/FPS/accuracy thật trên
-    TOÀN BỘ test_set cho ONNX + cả 3 file tflite (fp32/fp16/int8) vừa xuất, có
-    warmup 100 lần + nghỉ 3s giữa mỗi model (khác với backend_eval trong
-    _run_tflite_pipeline — cái đó chỉ eval accuracy nhanh, KHÔNG đo latency chuẩn).
 
-    Không raise nếu lỗi — chỉ log cảnh báo, không làm gãy pipeline export.
-
-    Yêu cầu bench_dataset.py nằm CÙNG THƯ MỤC với environment.py/onnx_to_tflite.py
-    (tflite_project_dir), và hỗ trợ --tflite-dir để tự quét nhiều file .tflite.
-    """
     if not dataset_yaml:
         if verbose:
             print("  [bench] Không có dataset_yaml — bỏ qua bench_dataset.py.")
@@ -296,6 +335,8 @@ def export_all(
     validate:     bool  = True,
     atol:         float = 1e-3,
     rtol:         float = 1e-3,
+    # ── TorchScript full (tự chứa kiến trúc) ────────────────
+    export_torchscript: bool = True,
     # ── TFLite (subprocess venv-tflite) ─────────────────────
     export_tflite: bool = True,
     test_dir:      str | None = None,
@@ -309,43 +350,6 @@ def export_all(
     # ── Test torch (process chính) ──────────────────────────
     test_loader:   Iterable | None = None,
 ) -> dict[str, Path | dict | bool | None]:
-    """Xuất train / deploy / onnx, kèm validate, rồi (nếu export_tflite=True) đẩy
-    ONNX sang subprocess venv-tflite để convert TFLite + eval accuracy ONNX/TFLite
-    trên test_dir thật, SAU ĐÓ tự động benchmark latency/FPS thật (bench_dataset.py)
-    trên toàn bộ test_set nếu có dataset_yaml. Nếu test_loader được truyền, tự chạy
-    thêm accuracy torch trong process chính và gộp chung vào test_results.
-
-    Args:
-        model:         GLKANet ở eval mode
-        save_dir:      thư mục exp (weights/ sẽ tạo bên trong)
-        yaml_path:     path file yaml kiến trúc — bắt buộc, tự copy vào weights/
-        input_size:    chiều ảnh vuông
-        opset:         ONNX opset (>= 18)
-        verbose:       in log
-        validate:      bật/tắt validate train-vs-deploy-vs-onnx
-        atol/rtol:     ngưỡng sai số logits fp32
-        export_tflite: bật/tắt convert + eval TFLite qua subprocess
-        test_dir:      thư mục ảnh test THẬT dạng ImageFolder — dùng để eval accuracy
-                       nhanh (backend_eval) VÀ làm calib_dir cho int8
-        dataset_yaml:  path tới dataset.yaml (path/train/test) — nếu truyền vào,
-                       tự động gọi bench_dataset.py để đo latency/FPS/accuracy thật
-                       trên toàn bộ test_set (có warmup + nghỉ giữa model, giống
-                       benchmark chuẩn kiểu YOLO). Bỏ trống thì chỉ có backend_eval
-                       nhanh từ bước TFLite, không có bench thật.
-        class_names:   list tên class đúng thứ tự index model output
-        tflite_project_dir: path tới thư mục chứa environment.py + onnx_to_tflite.py
-                       + bench_dataset.py
-        tflite_mode:   "fp32" | "fp16" | "int8" | "all"
-        n_calib:       số ảnh dùng calibrate int8
-        mean/std:      normalize PHẢI khớp transforms.Normalize() lúc train
-                       (đọc từ train.yaml -> normalize.mean/std)
-        test_loader:   DataLoader test THẬT — nếu truyền vào, tự chạy accuracy torch
-                       trong process chính, gộp chung bảng kết quả với onnx/tflite
-
-    Returns:
-        {"train", "deploy", "onnx", "tflite_dir": Path|None, "yaml": Path,
-         "validated": bool, "test_results": dict | None}
-    """
     yaml_path = Path(yaml_path)
     if not yaml_path.exists():
         raise FileNotFoundError(f"yaml_path không tồn tại: {yaml_path}")
@@ -360,6 +364,26 @@ def export_all(
     torch.save({"state_dict": model.state_dict(), "deployed": False}, path_train)
     if verbose:
         print(f"  [export] train   → {path_train.name}")
+
+    # ── 1b. Train weights FULL (TorchScript, tự chứa kiến trúc, CHƯA reparam) ──
+    path_train_full = None
+    if export_torchscript:
+        # Deepcopy + .cpu() để không đụng vào `model` gốc (có thể đang ở GPU
+        # và còn được dùng tiếp cho các bước train/eval khác sau export_all).
+        model_train_cpu = copy.deepcopy(model).cpu()
+        model_train_cpu.eval()
+        path_train_full, _ = _export_torchscript(
+            model_train_cpu, weights_dir, input_size, verbose=verbose,
+        )
+        # Đổi tên vì _export_torchscript mặc định lưu "best_deploy_full.pt"
+        # — ở đây đang trace bản TRAIN (chưa switch_to_deploy), cần tên khác
+        # để không đè lên file deploy_full lát nữa.
+        renamed = weights_dir / "best_train_full.pt"
+        if renamed.exists():
+            renamed.unlink()
+        path_train_full = path_train_full.replace(renamed)
+        if verbose:
+            print(f"  [export] train_full (TorchScript, tự chứa kiến trúc) → {path_train_full.name}")
 
     # ── 2. Deploy weights (đã reparam) ───────────────────────
     model_deploy = copy.deepcopy(model).cpu()
@@ -380,6 +404,18 @@ def export_all(
             model_cpu, model_deploy, input_size, atol=atol, rtol=rtol, verbose=verbose,
         )
         all_valid &= ok_reparam
+
+    # ── 2c. TorchScript full (tự chứa kiến trúc, load nhanh không cần yaml) ──
+    path_deploy_full = None
+    if export_torchscript:
+        path_deploy_full, ts_model = _export_torchscript(
+            model_deploy, weights_dir, input_size, verbose=verbose,
+        )
+        if validate:
+            ok_ts = _validate_torchscript(
+                model_deploy, ts_model, input_size, atol=atol, rtol=rtol, verbose=verbose,
+            )
+            all_valid &= ok_ts
 
     # ── 3. ONNX ──────────────────────────────────────────────
     path_onnx = weights_dir / "best_deploy.onnx"
@@ -455,12 +491,15 @@ def export_all(
 
     # ── 5. Copy yaml kiến trúc ────────────────────────────────
     path_yaml = weights_dir / yaml_path.name
-    shutil.copy2(yaml_path, path_yaml)
+    if yaml_path.resolve() != path_yaml.resolve():
+        shutil.copy2(yaml_path, path_yaml)
+    elif verbose:
+        print(f"  [export] yaml đã nằm sẵn trong weights_dir, bỏ qua copy.")
     if verbose:
         print(f"  [export] yaml    → {path_yaml.name}")
 
     if verbose:
-        _print_sizes(path_train, path_deploy, path_onnx, path_yaml)
+        _print_sizes(path_train, path_train_full, path_deploy, path_deploy_full, path_onnx, path_yaml)
         if validate:
             print(f"  [export] validate tổng: {'OK' if all_valid else 'CÓ MISMATCH — xem log ở trên'}")
 
@@ -513,7 +552,9 @@ def export_all(
 
     return {
         "train":        path_train,
+        "train_full":   path_train_full,
         "deploy":       path_deploy,
+        "deploy_full":  path_deploy_full,
         "onnx":         path_onnx,
         "tflite_dir":   tflite_dir,
         "yaml":         path_yaml,

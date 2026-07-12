@@ -3,9 +3,9 @@ import torch
 import torch.nn as nn
 
 try:
-    from glkanet.blocks.se_block import SEBlock
+    from glkanet.blocks.eca_block import ECABlock
 except ImportError:
-    from .se_block import SEBlock
+    from .eca_block import ECABlock
 
 GLKA_PRESETS: dict[int, list[tuple[int, int]]] = {
     13: [(3, 1), (3, 3), (5, 2), (5, 3), (13, 1)],
@@ -15,33 +15,35 @@ GLKA_PRESETS: dict[int, list[tuple[int, int]]] = {
 }
 
 
-def channel_shuffle(x: torch.Tensor, groups: int = 2) -> torch.Tensor:
-    # Dùng -1 cho batch (suy ra tự động, không cần đọc x.shape[0] tường minh) và ép
-    # c, h, w về Python int cố định khi có thể — giảm mạnh số node Shape/Gather/Cast/
-    # Unsqueeze thừa trong đồ thị ONNX (mỗi lần gọi hàm này vốn sinh ~10 node phụ trợ
-    # chỉ để tính lại kích thước động lúc runtime, dù kết quả luôn giống nhau).
-    c, h, w = x.shape[1], x.shape[2], x.shape[3]
-    x = x.reshape(-1, groups, c // groups, h, w)
-    x = x.transpose(1, 2).contiguous()
-    return x.reshape(-1, c, h, w)
-
-
 class GLKA_Shuffle(nn.Module):
     def __init__(
         self,
-        dim:             int,
-        out_channels:    int,
-        K:               int = 13,
-        stride:          int = 1,
-        branches_config: list | None = None,
-        se_reduction:    int = 8,
+        dim:              int,
+        out_channels:     int,
+        K:                int = 13,
+        stride:           int = 1,
+        branches_config:  list | None = None,
+        use_conv_replace: bool = False,
     ):
         super().__init__()
-        self.dim          = dim
-        self.out_channels = out_channels
-        self.K            = K
-        self.stride       = stride
-        self.mid_dim      = dim // 2
+        self.dim    = dim
+        self.K      = K
+        self.stride = stride
+        self.use_conv_replace = use_conv_replace
+
+        self.use_split      = (stride == 1)
+        self.branch_in_dim  = dim // 2 if self.use_split else dim
+        self.mid_dim         = self.branch_in_dim  # 2 nhánh luôn ra cùng số kênh, không proj
+
+        real_out_channels = 2 * self.branch_in_dim
+        if out_channels != real_out_channels:
+            raise ValueError(
+                f"GLKA_Shuffle: với dim={dim}, stride={stride} -> out_channels "
+                f"phải là {real_out_channels} (thuần depthwise, không thêm proj "
+                f"để ép kênh), nhưng yaml truyền out_channels={out_channels}. "
+                f"Sửa lại yaml cho khớp."
+            )
+        self.out_channels = real_out_channels
 
         if branches_config is not None:
             self.branches_config = [tuple(b) for b in branches_config]
@@ -50,55 +52,114 @@ class GLKA_Shuffle(nn.Module):
         else:
             raise ValueError(f"Không có preset cho K={K}")
 
-        # Tầng Conv_local DUY NHẤT trước khi rẽ nhánh
-        self.conv0 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=5, stride=stride, padding=2, groups=dim, bias=False),
-            nn.BatchNorm2d(dim),
+        # ── Nhánh trái: MaxPool -> ECA (bản gốc, giữ lại để so sánh/rollback)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=stride, padding=1)
+
+        # ── Nhánh trái (bản thay thế): depthwise conv 3x3 cùng stride/padding,
+        # KHÔNG đổi số kênh, có BN đi kèm vì conv cần chuẩn hóa (MaxPool thì
+        # không cần). groups=mid_dim để giữ chi phí ngang MaxPool, không phải
+        # conv thường.
+        self.pool_replace = nn.Conv2d(
+            self.mid_dim, self.mid_dim, kernel_size=3, stride=stride,
+            padding=1, groups=self.mid_dim, bias=False,
+        )
+        self.pool_replace_bn = nn.BatchNorm2d(self.mid_dim)
+
+        self.eca = ECABlock(self.mid_dim)
+
+        # ── Nhánh phải: Conv_Nor = thuần depthwise 3x3 (giữ nguyên branch_in_dim
+        # = mid_dim, KHÔNG đổi kênh) -> BN -> ReLU6
+        self.conv_nor = nn.Sequential(
+            nn.Conv2d(self.branch_in_dim, self.branch_in_dim, kernel_size=3,
+                      stride=stride, padding=1, groups=self.branch_in_dim, bias=False),
+            nn.BatchNorm2d(self.branch_in_dim),
             nn.ReLU6(inplace=True),
         )
 
-        # Nhánh trái: Channel Attention (SE) — nhận thẳng x_left
-        self.se = SEBlock(self.mid_dim, reduction=se_reduction) if se_reduction > 0 else None
-
-        # Nhánh phải: Spatial Attention — nhận thẳng x_right
+        # ── Conv_spatial: multi-dilation depthwise branches, sum lại rồi fuse
         self.branches = nn.ModuleList()
         for k_size, dil in self.branches_config:
             pad = ((k_size - 1) * dil) // 2
             self.branches.append(nn.Sequential(
-                nn.Conv2d(self.mid_dim, self.mid_dim, k_size, padding=pad, groups=self.mid_dim, dilation=dil, bias=False),
+                nn.Conv2d(self.mid_dim, self.mid_dim, k_size, padding=pad,
+                          groups=self.mid_dim, dilation=dil, bias=False),
                 nn.BatchNorm2d(self.mid_dim),
             ))
 
-        # Fusion: conv1x1 groups=2, trộn thông tin nhờ channel_shuffle chạy trước đó
-        self.fuse = nn.Sequential(
-            nn.Conv2d(dim, out_channels, kernel_size=1, groups=2, bias=False),
-            nn.BatchNorm2d(out_channels),
+        self.spatial_fuse = nn.Sequential(
+            nn.Conv2d(self.mid_dim, self.mid_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self.mid_dim),
         )
 
         self.reparam_conv: nn.Conv2d | None = None
-        self._deployed = False  # True sau switch_to_deploy(): bỏ shuffle runtime, BN đã fold
+        self._deployed = False
+
+    def _channel_shuffle(self, x: torch.Tensor) -> torch.Tensor:
+        # C đã biết TĨNH từ __init__ (self.out_channels, python int thường) ->
+        # KHÔNG đọc lại từ x.shape mỗi forward như bản cũ. Bản cũ dùng
+        # b, c, h, w = x.shape rồi c // groups -> torch.jit.trace() phải sinh
+        # thêm aten::size + aten::floor_divide + aten::Int + prim::NumToTensor
+        # cho MỖI block (x8 block trong model = ~64 node bookkeeping thừa so
+        # với bản ONNX, vốn được onnxsim constant-fold hết những phép tính chỉ
+        # phụ thuộc shape cố định lúc export). B, H, W vẫn lấy động từ x.shape
+        # vì có thể đổi theo batch size / input size thật lúc infer.
+        b, _, h, w = x.shape
+        c = self.out_channels
+        groups = 2
+        x = x.view(b, groups, c // groups, h, w)
+        x = x.transpose(1, 2).contiguous()
+        return x.view(b, c, h, w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        anchor = self.conv0(x)
-        x_left, x_right = torch.chunk(anchor, chunks=2, dim=1)
-
-        ca = self.se(x_left) if self.se is not None else x_left
-
-        if self.reparam_conv is not None:
-            sa = self.reparam_conv(x_right)
+        if self.use_split:
+            x_ca, x_sa = torch.chunk(x, chunks=2, dim=1)
         else:
-            sa = sum(b(x_right) for b in self.branches)
+            x_ca, x_sa = x, x
+
+        # nhánh trái: MaxPool -> ECA  (hoặc depthwise conv -> BN -> ECA nếu bench)
+        if self.use_conv_replace:
+            if self._deployed:
+                # sau switch_to_deploy(): BN đã fuse vào pool_replace, không còn pool_replace_bn
+                ca = self.pool_replace(x_ca)
+            else:
+                ca = self.pool_replace_bn(self.pool_replace(x_ca))
+        else:
+            ca = self.maxpool(x_ca)
+        ca = self.eca(ca)
+
+        # nhánh phải: Conv_Nor -> Conv_spatial -> BN
+        sa = self.conv_nor(x_sa)
+        if self.reparam_conv is not None:
+            sa = self.reparam_conv(sa)
+        else:
+            sa = sum(b(sa) for b in self.branches)
+        sa = self.spatial_fuse(sa)
 
         out = torch.cat([ca, sa], dim=1)
-        out = channel_shuffle(out, groups=2)  # luôn chạy, kể cả deploy — không thể fold qua groups=2 conv
-        return self.fuse(out)
+        return self._channel_shuffle(out)
 
     # ── Deploy-time optimization ─────────────────────────────────────
     def switch_to_deploy(self) -> None:
         if self._deployed:
             return
 
-        # 1) Reparam 4 nhánh dilated -> 1 conv KxK
+        # 0) Fold BN vào pool_replace (chỉ cần nếu đang dùng bản conv thay MaxPool;
+        # nếu use_conv_replace=False thì MaxPool không có gì để fuse, bỏ qua)
+        if self.use_conv_replace:
+            w_pr, b_pr = self._fuse_bn(nn.Sequential(self.pool_replace, self.pool_replace_bn))
+            new_pool_replace = nn.Conv2d(
+                self.mid_dim, self.mid_dim, 3, stride=self.stride,
+                padding=1, groups=self.mid_dim, bias=True,
+            )
+            new_pool_replace.weight.data = w_pr
+            new_pool_replace.bias.data   = b_pr
+            self.pool_replace = new_pool_replace
+            del self.pool_replace_bn
+        else:
+            del self.pool_replace
+            del self.pool_replace_bn
+
+        # 1) Reparam các nhánh dilated -> 1 conv KxK
         if hasattr(self, "branches"):
             W_equiv = 0
             B_equiv = 0
@@ -115,27 +176,20 @@ class GLKA_Shuffle(nn.Module):
             self.reparam_conv.bias.data   = B_equiv
             del self.branches
 
-        # 2) Fold BN vào chính conv0 (bias-add, không cần BN runtime nữa)
-        w0, b0 = self._fuse_bn(self.conv0[:2])
-        new_conv0 = nn.Conv2d(self.dim, self.dim, 5, stride=self.stride,
-                               padding=2, groups=self.dim, bias=True)
-        new_conv0.weight.data = w0
-        new_conv0.bias.data   = b0
-        self.conv0 = nn.Sequential(new_conv0, nn.ReLU6(inplace=True))
+        # 2) Fold BN vào conv_nor (thuần depthwise, đúng 1 cặp conv+bn)
+        w_nor, b_nor = self._fuse_bn(self.conv_nor[:2])
+        new_conv_nor = nn.Conv2d(self.branch_in_dim, self.branch_in_dim, 3, stride=self.stride,
+                                  padding=1, groups=self.branch_in_dim, bias=True)
+        new_conv_nor.weight.data = w_nor
+        new_conv_nor.bias.data   = b_nor
+        self.conv_nor = nn.Sequential(new_conv_nor, nn.ReLU6(inplace=True))
 
-        # 3) KHÔNG fold channel_shuffle vào fuse — fuse là Conv2d(groups=2), weight
-        #    chỉ có shape (out, dim/groups, 1, 1). Shuffle trộn thông tin XUYÊN 2 group,
-        #    còn conv groups=2 chỉ nhìn được trong phạm vi group của chính nó -> không có
-        #    cách nào biểu diễn phép trộn xuyên-group bằng cách permute weight của 1 conv
-        #    bị giới hạn trong group. Bản fold trước đó SAI (đã gây MISMATCH lúc export).
-        #    -> channel_shuffle() vẫn chạy runtime bình thường, kể cả ở deploy mode.
-
-        # 4) Fold BN vào chính fuse conv (vẫn hợp lệ, không liên quan tới shuffle)
-        wf, bf = self._fuse_bn(self.fuse)
-        new_fuse = nn.Conv2d(self.dim, self.out_channels, 1, groups=2, bias=True)
-        new_fuse.weight.data = wf
-        new_fuse.bias.data   = bf
-        self.fuse = new_fuse
+        # 3) Fold BN vào spatial_fuse
+        w_sf, b_sf = self._fuse_bn(self.spatial_fuse)
+        new_spatial_fuse = nn.Conv2d(self.mid_dim, self.mid_dim, 1, bias=True)
+        new_spatial_fuse.weight.data = w_sf
+        new_spatial_fuse.bias.data   = b_sf
+        self.spatial_fuse = new_spatial_fuse
 
         self._deployed = True
 

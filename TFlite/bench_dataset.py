@@ -13,7 +13,13 @@ bench_dataset.py — Benchmark ONNX vs TFLite chạy TRÊN TOÀN BỘ test_set t
     - Tự tính accuracy luôn (tiện có sẵn label từ tên thư mục con), không tốn thêm công.
     - Xuất báo cáo JSON đầy đủ + in bảng tổng kết ra console.
 
-BẢN SỬA: thêm --tflite-dir để tự quét TOÀN BỘ file .tflite trong 1 thư mục (vd
+BẢN SỬA (multi-thread benchmark): thêm --num-threads-list để benchmark CÙNG 1 model
+lần lượt với nhiều số CPU thread khác nhau (vd "2,4,8") — dùng để đo scaling
+theo số core, đúng nhu cầu so sánh 2 vs 4 vs 8 core trên Raspberry Pi/Jetson.
+Mỗi cấu hình thread sẽ tạo 1 session/interpreter RIÊNG (intra_op_num_threads cho
+ONNX Runtime, num_threads cho TFLite Interpreter), có nghỉ giữa mỗi lần đo.
+
+BẢN SỬA (trước đó): thêm --tflite-dir để tự quét TOÀN BỘ file .tflite trong 1 thư mục (vd
 weights/tflite/ với best_deploy_fp32.tflite, best_deploy_fp16.tflite,
 best_deploy_int8.tflite) và benchmark lần lượt từng file, có nghỉ giữa mỗi model
 — dùng cho pipeline tự động gọi từ exporter.py sau khi train xong.
@@ -22,22 +28,29 @@ Chạy (trong venv-tflite vì cần cả onnxruntime lẫn tensorflow/tflite_run
     pip install onnx onnxruntime numpy pillow pyyaml psutil --break-system-packages
     # (tensorflow đã có sẵn trong venv-tflite để đọc .tflite)
 
-    # Benchmark 1 file tflite cụ thể (cách cũ, vẫn dùng được):
+    # Benchmark 1 file tflite cụ thể, mặc định thread (không control):
     python bench_dataset.py ^
         --dataset-yaml "C:\\...\\dataset.yaml" ^
         --onnx "C:\\...\\best_deploy.onnx" ^
         --tflite "C:\\...\\best_deploy_fp32.tflite" ^
-        --input-size 224
+        --input-size 224 ^
+        --num-threads-list ""
 
-    # Benchmark cả 3 file trong 1 thư mục (dùng cho pipeline tự động):
+    # Benchmark cả 3 file trong 1 thư mục, lần lượt với 2/4/8 thread:
     python bench_dataset.py ^
         --dataset-yaml "C:\\...\\dataset.yaml" ^
         --onnx "C:\\...\\best_deploy.onnx" ^
         --tflite-dir "C:\\...\\weights\\tflite" ^
-        --input-size 224
+        --input-size 224 ^
+        --num-threads-list 2,4,8
 
     Có thể benchmark chỉ 1 model (bỏ --onnx hoặc --tflite/--tflite-dir tương ứng).
     Dùng --limit N để chạy thử nhanh trên N ảnh đầu tiên trước khi chạy full test_set.
+
+LƯU Ý khi đọc kết quả nhiều thread: Raspberry Pi 4/5 chỉ có 4 core vật lý — số
+thread > 4 là oversubscription, thường KHÔNG nhanh hơn (có khi chậm hơn do
+context-switch). Model dùng nhiều depthwise conv nhỏ (ít FLOPs/op) thường bão
+hòa scaling sớm hơn model dense-conv lớn.
 """
 from __future__ import annotations
 
@@ -245,6 +258,7 @@ def benchmark_onnx_dataset(
     input_size: int,
     mean, std,
     provider_name: str = "CPU",
+    num_threads: int | None = None,
 ) -> dict:
     import onnxruntime as ort
 
@@ -254,8 +268,15 @@ def benchmark_onnx_dataset(
     if requested not in available:
         return {"error": f"{requested} không có sẵn. Available: {available}"}
 
+    # Control số thread CPU dùng cho intra-op (song song trong 1 op, vd conv
+    # chia nhỏ theo channel) — đây là tham số quyết định "dùng bao nhiêu core".
+    sess_options = ort.SessionOptions()
+    if num_threads is not None:
+        sess_options.intra_op_num_threads = num_threads
+        sess_options.inter_op_num_threads = 1  # tắt song song giữa các op độc lập, tránh cộng dồn ngoài ý muốn
+
     try:
-        sess = ort.InferenceSession(model_path, providers=[requested])
+        sess = ort.InferenceSession(model_path, sess_options=sess_options, providers=[requested])
     except Exception as ex:
         return {"error": f"Không tạo được session: {ex}"}
 
@@ -305,6 +326,7 @@ def benchmark_onnx_dataset(
     result["preprocess_time_s"] = preprocess_time_s
     result["accuracy"] = round(correct / len(valid_labels), 4)
     result["correct"] = correct
+    result["num_threads_requested"] = num_threads if num_threads is not None else "default"
     result.update(mem_result)
     return result
 
@@ -329,11 +351,17 @@ def benchmark_tflite_dataset(
     labels: list[int],
     input_size: int,
     mean, std,
+    num_threads: int | None = None,
 ) -> dict:
     Interpreter, backend_name = _get_tflite_interpreter_cls()
 
     try:
-        interp = Interpreter(model_path=model_path)
+        # TFLite Interpreter hỗ trợ sẵn tham số num_threads trong constructor —
+        # quyết định số CPU thread dùng cho các op có kernel đa luồng (XNNPACK).
+        kwargs = {"model_path": model_path}
+        if num_threads is not None:
+            kwargs["num_threads"] = num_threads
+        interp = Interpreter(**kwargs)
         interp.allocate_tensors()
     except Exception as ex:
         return {"error": f"Không tạo được interpreter: {ex}"}
@@ -408,6 +436,7 @@ def benchmark_tflite_dataset(
     result["preprocess_time_s"] = preprocess_time_s
     result["accuracy"] = round(correct / len(valid_labels), 4)
     result["correct"] = correct
+    result["num_threads_requested"] = num_threads if num_threads is not None else "default"
     result.update(mem_result)
     return result
 
@@ -424,6 +453,7 @@ def print_result(label: str, r: dict) -> None:
         print(f"  ❌ LỖI: {r['error']}")
         return
     print(f"  Số ảnh chạy         : {r['n_images']} (bỏ qua {r['skipped_images']} ảnh lỗi)")
+    print(f"  Số thread yêu cầu   : {r.get('num_threads_requested', 'default')}")
     print(f"  Tổng thời gian infer: {r['total_time_s']} giây (KHÔNG tính preprocess/warmup)")
     print(f"  Thời gian preprocess: {r['preprocess_time_s']} giây (decode + resize toàn bộ ảnh)")
     print(f"  Latency mean/median : {r['latency_mean_ms']} / {r['latency_median_ms']} ms (CV {r['cv_percent']}%)")
@@ -450,6 +480,12 @@ def main():
     ap.add_argument("--std", default=",".join(str(x) for x in DEFAULT_STD), help="Std normalize, 3 số cách nhau bởi dấu phẩy")
     ap.add_argument("--onnx-provider", default="CPU", choices=["CPU", "CUDA", "TensorRT"], help="Provider cho ONNX Runtime")
     ap.add_argument("--limit", type=int, default=None, help="Chỉ chạy N ảnh đầu tiên (test nhanh trước khi chạy full)")
+    ap.add_argument("--num-threads-list", default="2,4,8",
+                     help="Danh sách số CPU thread cần benchmark, cách nhau bởi dấu phẩy "
+                          "(vd '2,4,8'). Mỗi model sẽ được benchmark lại 1 lần cho MỖI số "
+                          "thread trong danh sách (session/interpreter riêng cho mỗi lần), "
+                          "có nghỉ giữa mỗi lần đo. Truyền chuỗi rỗng '' để chỉ chạy 1 lần "
+                          "với cấu hình mặc định (không ép số thread).")
     ap.add_argument("--out", default="./bench_results", help="Thư mục lưu báo cáo JSON")
     args = ap.parse_args()
 
@@ -469,77 +505,79 @@ def main():
         labels = labels[:args.limit]
         print(f"  --limit={args.limit} → chỉ chạy {len(image_paths)} ảnh đầu tiên.")
 
+    if args.num_threads_list.strip():
+        thread_list: list[int | None] = [int(x) for x in args.num_threads_list.split(",")]
+    else:
+        thread_list = [None]
+    print(f"  Cấu hình thread sẽ chạy: {thread_list}")
+
     all_results: dict[str, dict] = {}
 
-    # ── Benchmark ONNX (nếu có) ──────────────────────────────────────
-    if args.onnx:
-        if not Path(args.onnx).exists():
-            print(f"❌ Không tìm thấy file ONNX: {args.onnx}")
-            sys.exit(1)
-        print(f"\n{'#'*70}\n# BENCHMARK ONNX: {args.onnx}\n{'#'*70}")
-        t_start = time.perf_counter()
-        r = benchmark_onnx_dataset(args.onnx, image_paths, labels, args.input_size, mean, std, args.onnx_provider)
-        r["wall_clock_total_s"] = round(time.perf_counter() - t_start, 3)
-        all_results["onnx"] = {"model_path": str(Path(args.onnx).resolve()), "result": r}
-        print_result(f"ONNX ({args.onnx_provider})", r)
+    for cfg_idx, nt in enumerate(thread_list):
+        nt_label = f"{nt}threads" if nt is not None else "default"
+        print(f"\n{'='*70}\n  ═══ CẤU HÌNH: {nt_label} ═══\n{'='*70}")
 
-    # ── Xác định danh sách file TFLite cần benchmark: ưu tiên --tflite-dir ──
-    tflite_targets: list[Path] = []
-    if args.tflite_dir:
-        tflite_targets = sorted(Path(args.tflite_dir).glob("*.tflite"))
-        if not tflite_targets:
-            print(f"❌ Không tìm thấy file .tflite nào trong: {args.tflite_dir}")
-            sys.exit(1)
-    elif args.tflite:
-        p = Path(args.tflite)
-        if not p.exists():
-            print(f"❌ Không tìm thấy file TFLite: {args.tflite}")
-            sys.exit(1)
-        tflite_targets = [p]
+        # ── Benchmark ONNX (nếu có) ──────────────────────────────────
+        if args.onnx:
+            if not Path(args.onnx).exists():
+                print(f"❌ Không tìm thấy file ONNX: {args.onnx}")
+                sys.exit(1)
+            print(f"\n{'#'*70}\n# BENCHMARK ONNX [{nt_label}]: {args.onnx}\n{'#'*70}")
+            t_start = time.perf_counter()
+            r = benchmark_onnx_dataset(args.onnx, image_paths, labels, args.input_size, mean, std,
+                                        args.onnx_provider, num_threads=nt)
+            r["wall_clock_total_s"] = round(time.perf_counter() - t_start, 3)
+            key = f"onnx_{nt_label}"
+            all_results[key] = {"model_path": str(Path(args.onnx).resolve()), "result": r}
+            print_result(f"ONNX ({args.onnx_provider}) [{nt_label}]", r)
 
-    if args.onnx and tflite_targets:
-        print(f"\n⏸  Nghỉ {PAUSE_BETWEEN_MODELS_S}s giữa ONNX và loạt TFLite để hệ thống ổn định lại...")
-        time.sleep(PAUSE_BETWEEN_MODELS_S)
+        # ── Xác định danh sách file TFLite cần benchmark: ưu tiên --tflite-dir ──
+        tflite_targets: list[Path] = []
+        if args.tflite_dir:
+            tflite_targets = sorted(Path(args.tflite_dir).glob("*.tflite"))
+            if not tflite_targets:
+                print(f"❌ Không tìm thấy file .tflite nào trong: {args.tflite_dir}")
+                sys.exit(1)
+        elif args.tflite:
+            p = Path(args.tflite)
+            if not p.exists():
+                print(f"❌ Không tìm thấy file TFLite: {args.tflite}")
+                sys.exit(1)
+            tflite_targets = [p]
 
-    # ── Benchmark từng file TFLite, có nghỉ giữa mỗi model ────────────
-    for i, tflite_path in enumerate(tflite_targets):
-        if i > 0:
-            print(f"\n⏸  Nghỉ {PAUSE_BETWEEN_MODELS_S}s trước khi benchmark model tiếp theo...")
+        if args.onnx and tflite_targets:
+            print(f"\n⏸  Nghỉ {PAUSE_BETWEEN_MODELS_S}s giữa ONNX và loạt TFLite để hệ thống ổn định lại...")
             time.sleep(PAUSE_BETWEEN_MODELS_S)
-        key = tflite_path.stem  # vd: best_deploy_fp32 -> dùng luôn làm key kết quả
-        print(f"\n{'#'*70}\n# BENCHMARK TFLITE [{key}]: {tflite_path}\n{'#'*70}")
-        t_start = time.perf_counter()
-        r = benchmark_tflite_dataset(str(tflite_path), image_paths, labels, args.input_size, mean, std)
-        r["wall_clock_total_s"] = round(time.perf_counter() - t_start, 3)
-        all_results[key] = {"model_path": str(tflite_path.resolve()), "result": r}
-        print_result(f"TFLite [{key}]", r)
 
-    # ── So sánh nhanh (baseline ONNX vs mọi backend TFLite) ───────────
-    tflite_keys = [k for k in all_results if k != "onnx"]
-    if "onnx" in all_results and tflite_keys:
-        ro = all_results["onnx"]["result"]
-        if "error" not in ro:
-            print(f"\n{'='*70}\n  SO SÁNH NHANH (baseline: ONNX)\n{'='*70}")
-            print(f"  {'Backend':<22} {'Latency(ms)':>14} {'FPS':>10} {'Acc(%)':>10}")
-            print(f"  {'-'*22} {'-'*14} {'-'*10} {'-'*10}")
-            print(f"  {'onnx':<22} {ro['latency_mean_ms']:>14} {ro['throughput_fps']:>10} {ro['accuracy']*100:>9.2f}")
-            for name in tflite_keys:
-                r = all_results[name]["result"]
-                if "error" in r:
-                    print(f"  {name:<22} {'--- lỗi ---':>14}")
-                    continue
-                print(f"  {name:<22} {r['latency_mean_ms']:>14} {r['throughput_fps']:>10} {r['accuracy']*100:>9.2f}")
-    elif len(tflite_keys) > 1:
-        # Không có ONNX nhưng có nhiều TFLite -> vẫn in bảng so sánh giữa các TFLite
-        print(f"\n{'='*70}\n  SO SÁNH NHANH (giữa các bản TFLite)\n{'='*70}")
-        print(f"  {'Backend':<22} {'Latency(ms)':>14} {'FPS':>10} {'Acc(%)':>10}")
-        print(f"  {'-'*22} {'-'*14} {'-'*10} {'-'*10}")
-        for name in tflite_keys:
-            r = all_results[name]["result"]
-            if "error" in r:
-                print(f"  {name:<22} {'--- lỗi ---':>14}")
-                continue
-            print(f"  {name:<22} {r['latency_mean_ms']:>14} {r['throughput_fps']:>10} {r['accuracy']*100:>9.2f}")
+        # ── Benchmark từng file TFLite, có nghỉ giữa mỗi model ────────────
+        for i, tflite_path in enumerate(tflite_targets):
+            if i > 0:
+                print(f"\n⏸  Nghỉ {PAUSE_BETWEEN_MODELS_S}s trước khi benchmark model tiếp theo...")
+                time.sleep(PAUSE_BETWEEN_MODELS_S)
+            key = f"{tflite_path.stem}_{nt_label}"
+            print(f"\n{'#'*70}\n# BENCHMARK TFLITE [{key}]: {tflite_path}\n{'#'*70}")
+            t_start = time.perf_counter()
+            r = benchmark_tflite_dataset(str(tflite_path), image_paths, labels, args.input_size, mean, std,
+                                          num_threads=nt)
+            r["wall_clock_total_s"] = round(time.perf_counter() - t_start, 3)
+            all_results[key] = {"model_path": str(tflite_path.resolve()), "result": r}
+            print_result(f"TFLite [{key}]", r)
+
+        # ── Nghỉ giữa các cấu hình thread khác nhau (trừ lần cuối) ──────────
+        if cfg_idx < len(thread_list) - 1:
+            print(f"\n⏸  Nghỉ {PAUSE_BETWEEN_MODELS_S}s trước khi đổi sang cấu hình thread tiếp theo...")
+            time.sleep(PAUSE_BETWEEN_MODELS_S)
+
+    # ── So sánh nhanh: bảng tổng hợp toàn bộ (model x thread) ─────────
+    print(f"\n{'='*70}\n  SO SÁNH TỔNG HỢP (tất cả model x tất cả cấu hình thread)\n{'='*70}")
+    print(f"  {'Backend':<30} {'Latency(ms)':>14} {'FPS':>10} {'Acc(%)':>10}")
+    print(f"  {'-'*30} {'-'*14} {'-'*10} {'-'*10}")
+    for name, entry in all_results.items():
+        r = entry["result"]
+        if "error" in r:
+            print(f"  {name:<30} {'--- lỗi ---':>14}")
+            continue
+        print(f"  {name:<30} {r['latency_mean_ms']:>14} {r['throughput_fps']:>10} {r['accuracy']*100:>9.2f}")
 
     # ── Lưu báo cáo ──
     Path(args.out).mkdir(parents=True, exist_ok=True)
@@ -555,6 +593,7 @@ def main():
             "mean": mean, "std": std,
             "warmup_runs": WARMUP_RUNS,
             "pause_between_models_s": PAUSE_BETWEEN_MODELS_S,
+            "num_threads_list": thread_list,
             "results": all_results,
         }, f, ensure_ascii=False, indent=2)
     print(f"\n✅ Đã lưu báo cáo đầy đủ: {out_path}")

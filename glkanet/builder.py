@@ -8,10 +8,10 @@ import yaml
 from pathlib import Path
 
 try:
-    from glkanet.blocks import BLOCK_REGISTRY, ConvBnRelu, EfficientBlock, ShuffleGLKABlock
+    from glkanet.blocks import BLOCK_REGISTRY, ConvBnRelu, Dual_Attention_Block, ShuffleGLKABlock
 except ImportError:
     try:
-        from blocks import BLOCK_REGISTRY, ConvBnRelu, EfficientBlock, ShuffleGLKABlock
+        from blocks import BLOCK_REGISTRY, ConvBnRelu, Dual_Attention_Block, ShuffleGLKABlock
     except ImportError:
         # Dự phòng nếu registry được import trực tiếp từ file cục bộ
         BLOCK_REGISTRY = {}
@@ -23,46 +23,55 @@ except ImportError:
 
 class ClassifierHead(nn.Module):
     """
-    GAP → Flatten → [BN1d] → [Linear(in→mid) + BN1d + Hardswish] → Dropout → Linear(→nc)
+    Head cố định, đơn giản:
+        GAP → Flatten → BatchNorm1d → Dropout → Linear(in_features → num_classes)
+
+    Không còn nhánh mid_features/bottleneck, không còn cờ use_bn — BN1d luôn
+    bật để chuẩn hoá feature vector trước Linear. switch_to_deploy() fold
+    BN1d vào Linear thành 1 lớp Linear duy nhất (bias=True) cho deploy.
     """
     def __init__(
         self,
         in_features:  int,
         num_classes:  int,
         dropout:      float = 0.2,
-        mid_features: int   = 0,
-        use_bn:       bool  = False,
     ):
         super().__init__()
         self.pool    = nn.AdaptiveAvgPool2d(1)
         self.flatten = nn.Flatten()
 
-        layers: list[nn.Module] = []
+        self.bn      = nn.BatchNorm1d(in_features)
+        self.dropout = nn.Dropout(p=dropout)
+        self.fc      = nn.Linear(in_features, num_classes)
 
-        if use_bn:
-            layers.append(nn.BatchNorm1d(in_features))
-
-        if mid_features > 0:
-            layers += [
-                nn.Linear(in_features, mid_features, bias=False),
-                nn.BatchNorm1d(mid_features),
-                nn.Hardswish(inplace=True),
-                nn.Dropout(p=dropout),
-                nn.Linear(mid_features, num_classes),
-            ]
-        else:
-            layers += [
-                nn.Dropout(p=dropout),
-                nn.Linear(in_features, num_classes),
-            ]
-
-        self.classifier = nn.Sequential(*layers)
+        self._deployed = False
 
     def forward(self, x: torch.Tensor):
         x        = self.pool(x)
         features = self.flatten(x)
-        logits   = self.classifier(features)
+        out      = self.bn(features)
+        out      = self.dropout(out)
+        logits   = self.fc(out)
         return logits, features
+
+    def switch_to_deploy(self) -> None:
+        """Fold BatchNorm1d vào Linear: BN(x) -> Linear thành 1 Linear duy nhất
+        (Dropout ở eval() vốn đã là no-op nên không cần xử lý riêng)."""
+        if self._deployed:
+            return
+
+        std   = (self.bn.running_var + self.bn.eps).sqrt()
+        gamma = self.bn.weight / std                      # (in_features,)
+        beta  = self.bn.bias - self.bn.running_mean * gamma  # (in_features,)
+
+        new_fc = nn.Linear(self.fc.in_features, self.fc.out_features)
+        # y = W(gamma*x + beta) + b = (W*gamma) x + (W@beta + b)
+        new_fc.weight.data = self.fc.weight * gamma.unsqueeze(0)
+        new_fc.bias.data   = self.fc.weight @ beta + self.fc.bias
+
+        self.bn = nn.Identity()
+        self.fc = new_fc
+        self._deployed = True
 
 
 # ──────────────────────────────────────────────────────────────
@@ -81,10 +90,14 @@ class GLKANet(nn.Module):
         self.head            = head
         self.layer_channels  = layer_channels
 
-    def forward(self, x: torch.Tensor):
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.backbone_layers:
             x = layer(x)
-        return self.head(x)
+        return x
+
+    def forward(self, x: torch.Tensor):
+        feat = self.forward_features(x)
+        return self.head(feat)
 
     def switch_to_deploy(self) -> "GLKANet":
         """Quét toàn bộ mô hình và gọi switch_to_deploy() của mọi block con nếu có."""
@@ -94,13 +107,6 @@ class GLKANet(nn.Module):
         return self
 
     def is_deployed(self) -> bool:
-        """Kiểm tra xem mô hình đã gộp nhánh (reparam) chưa, tránh đệ quy vô hạn.
-
-        Check TỔNG QUÁT theo attribute `reparam_conv` — KHÔNG hardcode tên class
-        (khác bản cũ liệt kê "GLKA_Shuffle", "GLKA_SExCA"...). Nhờ vậy khi bạn
-        thêm biến thể GLKA mới (GLKA_XYZ...) sau này, hàm này tự nhận diện đúng
-        mà không cần sửa lại danh sách tên ở đây.
-        """
         for m in self.modules():
             if m is self:
                 continue
@@ -121,22 +127,12 @@ class GLKANet(nn.Module):
 # ──────────────────────────────────────────────────────────────
 
 def _out_channels_of(block: nn.Module) -> int:
-    """Đọc số lượng đầu ra kênh (out_channels) một cách an toàn mà không bị gãy khi đổi vị trí tham số.
-
-    LƯU Ý QUAN TRỌNG: nhánh nhanh (đầu tiên) chỉ hoạt động nếu block TỰ LƯU
-    `self.out_channels` (hoặc `self.out_ch`) trong __init__. Nếu block mới bạn
-    viết sau này quên lưu attribute này, hàm sẽ rơi xuống fallback forward-dummy
-    (chậm hơn và có thể sai channel giả định), rồi tới fallback quét ngược module
-    cuối cùng (dễ sai nếu switch_to_deploy() đổi cấu trúc module con).
-    → Khi viết block mới: LUÔN thêm `self.out_channels = out_channels` trong __init__.
-    """
     for attr in ("out_channels", "out_ch"):
         if hasattr(block, attr):
             val = getattr(block, attr)
             if isinstance(val, int):
                 return val
 
-    # Dự phòng (Fallback): forward thử nghiệm bằng ma trận 0 nếu không tìm thấy thuộc tính
     with torch.no_grad():
         in_ch = getattr(block, "in_channels", 16)
         try:
@@ -146,7 +142,6 @@ def _out_channels_of(block: nn.Module) -> int:
                 out = out[0]
             return out.shape[1]
         except Exception:
-            # Quét ngược các lớp layer cuối cùng để lấy cấu hình channel thực tế
             for m in reversed(list(block.modules())):
                 if isinstance(m, (nn.Conv2d, nn.BatchNorm2d, nn.Linear)):
                     if hasattr(m, "out_channels"): return m.out_channels
@@ -156,7 +151,6 @@ def _out_channels_of(block: nn.Module) -> int:
 
 
 def _build_block(block_name: str, in_channels: int, args: list) -> nn.Module:
-    """Khởi tạo block từ registry dựa trên mảng tham số (list) truyền thống từ YAML."""
     cls = BLOCK_REGISTRY.get(block_name)
     if cls is None:
         raise ValueError(
@@ -178,14 +172,12 @@ def build_from_yaml(yaml_path: str | Path, in_channels: int = 3) -> GLKANet:
 
     num_classes: int = cfg["nc"]
 
-    # ── Parse head config ──────────────────────────────────────
+    # ── Parse head config (chỉ còn dropout) ────────────────────
     head_cfg = cfg.get("head", {})
     if not isinstance(head_cfg, dict):
         head_cfg = {}
 
-    dropout      = float(head_cfg.get("dropout",      0.2))
-    mid_features = int(head_cfg.get("mid_features",   0))
-    use_bn       = bool(head_cfg.get("use_bn",        False))
+    dropout = float(head_cfg.get("dropout", 0.2))
 
     # ── Build backbone ─────────────────────────────────────────
     backbone_layers: list[nn.Module] = []
@@ -198,7 +190,7 @@ def build_from_yaml(yaml_path: str | Path, in_channels: int = 3) -> GLKANet:
 
         for _ in range(repeats):
             block  = _build_block(block_name, in_ch, args)
-            out_ch = _out_channels_of(block)  # <--- Đọc động trực tiếp từ instance block vừa tạo
+            out_ch = _out_channels_of(block)
 
             backbone_layers.append(block)
             layer_channels.append(out_ch)
@@ -207,11 +199,9 @@ def build_from_yaml(yaml_path: str | Path, in_channels: int = 3) -> GLKANet:
 
     # ── Build head ─────────────────────────────────────────────
     head = ClassifierHead(
-        in_features  = layer_channels[-1],
-        num_classes  = num_classes,
-        dropout      = dropout,
-        mid_features = mid_features,
-        use_bn       = use_bn,
+        in_features = layer_channels[-1],
+        num_classes = num_classes,
+        dropout     = dropout,
     )
 
     return GLKANet(

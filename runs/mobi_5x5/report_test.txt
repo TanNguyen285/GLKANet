@@ -1,3 +1,4 @@
+Mobilenet_GLKA
 Accuracy    : 0.8774
 F1 macro    : 0.8627
 F1 weighted : 0.8758

@@ -20,12 +20,11 @@ from glkanet.exporter import export_all, load_checkpoint
 from glkanet.blocks  import (
     BLOCK_REGISTRY, 
     SEBlock, 
-    EfficientBlock,
+    Dual_Attention_Block,
     ShuffleGLKABlock,
     GLKA_CBAM as GLKA_CBAM_Block,
     GLKA_Shuffle as GLKA_Shuffle_Block,
-    GLKA_SExCA as GLKA_SExCA_Block,
-    GLKA_CA_SE as GLKA_CA_SE_Block
+    ECABlock,   
 )
 
 __version__ = "1.0.0"
@@ -50,10 +49,9 @@ __all__ = [
     # ── Blocks ──
     "BLOCK_REGISTRY",
     "SEBlock",
-    "EfficientBlock",
+    "Dual_Attention_Block",
     "ShuffleGLKABlock",
     "GLKA_CBAM_Block",
     "GLKA_Shuffle_Block",
-    "GLKA_SExCA_Block",
-    "GLKA_CA_SE_Block",
+    "ECABlock",
 ]

@@ -1,0 +1,120 @@
+﻿Dual_ccmt_MaxPool2d
+  [export] File sizes:
+           best_train.pt             1.06 MB
+           best_train_full.pt        0.90 MB
+           best_deploy.pt            0.86 MB
+           best_deploy_full.pt       0.86 MB
+           best_deploy.onnx          0.89 MB
+           dualattention_glkaV1.yaml 0.00 MB
+  [export] validate tổng: OK
+
+  [test] ═══ Kết quả trên test set (torch + onnx/tflite + bench thật) ═══
+  Backend                     Accuracy     ms/ảnh        FPS
+  ------------------------- ---------- ---------- ----------
+  onnx                          88.24%      1.31          -
+  fp32                          88.00%      2.28          -
+  fp16                          88.00%      2.27          -
+  int8                          62.13%     10.78          -
+  onnx_2threads                 88.49%      1.50     664.79
+  best_deploy_fp16_2threads     88.53%      1.69     591.42
+  best_deploy_fp32_2threads     88.53%      1.71     585.95
+  best_deploy_int8_2threads     62.89%      8.20     122.01
+  onnx_4threads                 88.49%      1.23     812.62
+  best_deploy_fp16_4threads     88.53%      1.35     740.25
+  best_deploy_fp32_4threads     88.53%      1.32     760.03
+  best_deploy_int8_4threads     62.89%      8.72     114.62
+  onnx_8threads                 88.49%      1.39     719.72
+  best_deploy_fp16_8threads     88.53%      1.50     667.27
+  best_deploy_fp32_8threads     88.53%      1.48     673.66
+  best_deploy_int8_8threads     62.89%     53.89      18.55
+
+[re_export] Xong. Các file đã tạo:
+  train        → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt\weights\best_train.pt
+  train_full   → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt\weights\best_train_full.pt
+  deploy       → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt\weights\best_deploy.pt
+  deploy_full  → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt\weights\best_deploy_full.pt
+  onnx         → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt\weights\best_deploy.onnx
+  tflite_dir   → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt\weights\tflite
+  yaml         → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt\weights\dualattention_glkaV1.yaml
+  validated   → True
+
+[re_export] test_results (torch/onnx/tflite):
+  onnx: {'acc': 0.8823529411764706, 'ms_per_img': 1.314939162531424}
+  fp32: {'acc': 0.8799601196410768, 'ms_per_img': 2.2776042074076495}
+  fp16: {'acc': 0.8799601196410768, 'ms_per_img': 2.2696132203406196}
+  int8: {'acc': 0.6213359920239282, 'ms_per_img': 10.775911365937468}
+  onnx_2threads: {'acc': 0.8849, 'ms_per_img': 1.5042, 'fps': 664.795, 'peak_rss_mb': 3111.22}
+  best_deploy_fp16_2threads: {'acc': 0.8853, 'ms_per_img': 1.6908, 'fps': 591.423, 'peak_rss_mb': 3329.72}
+  best_deploy_fp32_2threads: {'acc': 0.8853, 'ms_per_img': 1.7066, 'fps': 585.95, 'peak_rss_mb': 3340.06}
+  best_deploy_int8_2threads: {'acc': 0.6289, 'ms_per_img': 8.1961, 'fps': 122.009, 'peak_rss_mb': 3351.57}
+  onnx_4threads: {'acc': 0.8849, 'ms_per_img': 1.2306, 'fps': 812.625, 'peak_rss_mb': 3345.4}
+  best_deploy_fp16_4threads: {'acc': 0.8853, 'ms_per_img': 1.3509, 'fps': 740.25, 'peak_rss_mb': 3339.99}
+  best_deploy_fp32_4threads: {'acc': 0.8853, 'ms_per_img': 1.3157, 'fps': 760.032, 'peak_rss_mb': 3340.87}
+  best_deploy_int8_4threads: {'acc': 0.6289, 'ms_per_img': 8.7244, 'fps': 114.621, 'peak_rss_mb': 3352.31}
+  onnx_8threads: {'acc': 0.8849, 'ms_per_img': 1.3894, 'fps': 719.718, 'peak_rss_mb': 3343.78}
+  best_deploy_fp16_8threads: {'acc': 0.8853, 'ms_per_img': 1.4986, 'fps': 667.268, 'peak_rss_mb': 3342.63}
+  best_deploy_fp32_8threads: {'acc': 0.8853, 'ms_per_img': 1.4844, 'fps': 673.663, 'peak_rss_mb': 3342.17}
+  best_deploy_int8_8threads: {'acc': 0.6289, 'ms_per_img': 53.8933, 'fps': 18.555, 'peak_rss_mb': 3216.2}
+
+
+
+Dual_ccmt_conv2d
+ [export] yaml đã nằm sẵn trong weights_dir, bỏ qua copy.
+  [export] yaml    → dualattention_glkaV1.yaml
+
+  [export] File sizes:
+           best_train.pt             1.06 MB
+           best_train_full.pt        0.94 MB
+           best_deploy.pt            0.90 MB
+           best_deploy_full.pt       0.90 MB
+           best_deploy.onnx          0.93 MB
+           dualattention_glkaV1.yaml 0.00 MB
+  [export] validate tổng: OK
+
+  [test] ═══ Kết quả trên test set (torch + onnx/tflite + bench thật) ═══
+  Backend                     Accuracy     ms/ảnh        FPS
+  ------------------------- ---------- ---------- ----------
+  onnx                          85.98%      1.29          -
+  fp32                          85.98%      2.24          -
+  fp16                          86.04%      2.31          -
+  int8                          86.04%     11.05          -
+  onnx_2threads                 86.68%      1.53     653.44
+  best_deploy_fp16_2threads     86.64%      1.67     598.08
+  best_deploy_fp32_2threads     86.68%      1.67     598.72
+  best_deploy_int8_2threads     86.68%      8.30     120.53
+  onnx_4threads                 86.68%      1.19     841.24
+  best_deploy_fp16_4threads     86.64%      1.24     809.44
+  best_deploy_fp32_4threads     86.68%      1.20     836.80
+  best_deploy_int8_4threads     86.68%      8.54     117.04
+  onnx_8threads                 86.68%      1.22     817.15
+  best_deploy_fp16_8threads     86.64%      1.53     653.53
+  best_deploy_fp32_8threads     86.68%      1.49     671.67
+  best_deploy_int8_8threads     86.68%     60.55      16.52
+
+[re_export] Xong. Các file đã tạo:
+  train        → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_conv2d\weights\best_train.pt
+  train_full   → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_conv2d\weights\best_train_full.pt
+  deploy       → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_conv2d\weights\best_deploy.pt
+  deploy_full  → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_conv2d\weights\best_deploy_full.pt
+  onnx         → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_conv2d\weights\best_deploy.onnx
+  tflite_dir   → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_conv2d\weights\tflite
+  yaml         → C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_conv2d\weights\dualattention_glkaV1.yaml
+  validated   → True
+
+[re_export] test_results (torch/onnx/tflite):
+  onnx: {'acc': 0.8598205383848455, 'ms_per_img': 1.2928509671085051}
+  fp32: {'acc': 0.8598205383848455, 'ms_per_img': 2.24323270188743}
+  fp16: {'acc': 0.8604187437686939, 'ms_per_img': 2.3111591226554076}
+  int8: {'acc': 0.8604187437686939, 'ms_per_img': 11.051533379845493}
+  onnx_2threads: {'acc': 0.8668, 'ms_per_img': 1.5304, 'fps': 653.437, 'peak_rss_mb': 3111.22}
+  best_deploy_fp16_2threads: {'acc': 0.8664, 'ms_per_img': 1.672, 'fps': 598.076, 'peak_rss_mb': 3326.58}
+  best_deploy_fp32_2threads: {'acc': 0.8668, 'ms_per_img': 1.6702, 'fps': 598.718, 'peak_rss_mb': 3339.95}
+  best_deploy_int8_2threads: {'acc': 0.8668, 'ms_per_img': 8.2964, 'fps': 120.534, 'peak_rss_mb': 3348.33}
+  onnx_4threads: {'acc': 0.8668, 'ms_per_img': 1.1887, 'fps': 841.244, 'peak_rss_mb': 3354.15}
+  best_deploy_fp16_4threads: {'acc': 0.8664, 'ms_per_img': 1.2354, 'fps': 809.44, 'peak_rss_mb': 3349.77}
+  best_deploy_fp32_4threads: {'acc': 0.8668, 'ms_per_img': 1.195, 'fps': 836.796, 'peak_rss_mb': 3348.08}
+  best_deploy_int8_4threads: {'acc': 0.8668, 'ms_per_img': 8.5442, 'fps': 117.039, 'peak_rss_mb': 3341.25}
+  onnx_8threads: {'acc': 0.8668, 'ms_per_img': 1.2238, 'fps': 817.151, 'peak_rss_mb': 3345.72}
+  best_deploy_fp16_8threads: {'acc': 0.8664, 'ms_per_img': 1.5301, 'fps': 653.534, 'peak_rss_mb': 3342.47}
+  best_deploy_fp32_8threads: {'acc': 0.8668, 'ms_per_img': 1.4888, 'fps': 671.674, 'peak_rss_mb': 3349.7}
+  best_deploy_int8_8threads: {'acc': 0.8668, 'ms_per_img': 60.5528, 'fps': 16.515, 'peak_rss_mb': 3343.13}

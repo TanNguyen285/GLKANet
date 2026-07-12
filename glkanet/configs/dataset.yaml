@@ -1,3 +1,3 @@
-path: C:\Users\ThisPC\Desktop\Raw Data\CCMT Dataset
-train: train_set
-test: test_set
+path: C:\Users\ThisPC\Desktop\Dataset for Crop Pest and Disease Detection\CCMT Dataset-Augmented
+#train: train
+#test: test

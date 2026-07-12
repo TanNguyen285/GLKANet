@@ -1,3 +1,4 @@
+Shuffle_GLKA
 Accuracy    : 0.8640
 F1 macro    : 0.8456
 F1 weighted : 0.8622

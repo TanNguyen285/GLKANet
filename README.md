@@ -2,127 +2,170 @@
 ```markdown
 # Simple_GLKA
 
-Repo này dùng để train, đánh giá và export mô hình phân loại ảnh theo kiến trúc GLKA. Mục tiêu là chạy được từ đầu đến cuối với cấu hình YAML, sau đó xuất ra file deploy và TFLite.
+Simple_GLKA is a lightweight PyTorch-based image classification pipeline for training, evaluating, and exporting GLKA-style models from YAML configuration files.
 
-## 1. Cài đặt ban đầu
+## Overview
 
-Cài các package cần thiết trước khi chạy:
+This repository is designed for fast experimentation with image classification models. You can:
+- define the model architecture in YAML
+- point the pipeline to your dataset
+- train and evaluate the model
+- export checkpoints, ONNX, and TFLite artifacts
+
+## Features
+
+- YAML-driven model definition
+- Support for ImageFolder-style datasets and CCMT-style datasets
+- Train / validation / test workflow
+- Automatic checkpoint saving for best F1 and best loss
+- ONNX export and TFLite export support
+- Logging, confusion matrices, and training curve plots
+
+## Project Structure
+
+```text
+Simple_GLKA/
+├── GLKAnet.py                # quick training entrypoint
+├── glkanet/                  # core library
+│   ├── core.py               # GLKA wrapper API
+│   ├── builder.py            # build model from YAML
+│   ├── trainer.py            # training loop and evaluation
+│   ├── exporter.py           # export logic
+│   ├── data/                 # data loaders and dataset parsing
+│   └── configs/              # model/data/train YAML files
+├── TFlite/                   # standalone TFLite export pipeline
+├── scripts/                  # helper scripts
+└── runs/                     # training outputs
+```
+
+## Installation
+
+Recommended Python version: 3.10+
+
+Install the main dependencies:
 
 ```bash
 pip install torch torchvision pyyaml numpy pillow scikit-learn matplotlib seaborn onnx onnxscript
 ```
 
-Nếu cần export sang TFLite, cài thêm bộ thư viện trong thư mục TFlite:
+If you want to export TFLite artifacts, install the additional requirements:
 
 ```bash
 pip install -r TFlite/requirements-tflite.txt
 ```
 
-## 2. Chuẩn bị dữ liệu
+## Quick Start
 
-Đặt dataset theo cấu trúc thư mục chuẩn hoặc dùng cấu trúc CCMT-style. File cấu hình dữ liệu nằm ở:
-
-- glkanet/configs/dataset.yaml
-
-Ví dụ ngắn:
-
-```yaml
-path: C:/path/to/your/dataset
-train: train_set
-test: test_set
-```
-
-## 3. Chỉnh cấu hình train
-
-File cấu hình chính nằm ở:
-
-- glkanet/configs/train.yaml
-
-Bạn có thể chỉnh các mục chính như:
-
-- epochs, batch_size, learning rate
-- device: cuda hoặc cpu
-- đường dẫn dataset
-- export: bật/tắt export ONNX/TFLite
-
-Lưu ý trên Windows nếu gặp lỗi multiprocessing thì đổi `num_workers` xuống `0`.
-
-## 4. Chạy train
-
-Từ thư mục gốc của repo, có thể chạy nhanh như sau:
-
-```bash
-python -m glkanet train --cfg glkanet/configs/train.yaml
-```
-
-Hoặc dùng script Python sẵn:
+### 1) Train from the provided script
 
 ```bash
 python GLKAnet.py
 ```
 
-Ví dụ dùng Python API:
+This uses the model config from [glkanet/configs/Hybird.yaml](glkanet/configs/Hybird.yaml) and the training config from [glkanet/configs/train.yaml](glkanet/configs/train.yaml).
+
+### 2) Train using Python API
 
 ```python
 from glkanet import GLKA
 
-model = GLKA("glkanet/configs/shuffle_glkav2.yaml")
+model = GLKA("glkanet/configs/Hybird.yaml")
 model.train("glkanet/configs/train.yaml")
-model.export()
 ```
 
-## 5. Kiểm tra / đánh giá
+### 3) Train using CLI
 
 ```bash
-python -m glkanet val --cfg glkanet/configs/train.yaml --split test
+python -m glkanet train --cfg glkanet/configs/train.yaml --model glkanet/configs/Hybird.yaml
 ```
 
-## 6. Export sang ONNX / TFLite
+## Dataset Preparation
 
-Sau khi train xong, repo sẽ tự động export các file ở thư mục `runs/expX/weights/`.
+The loader supports two common dataset layouts:
 
-Export thủ công:
+### ImageFolder-style
+
+```text
+dataset/
+├── train/
+│   ├── cat/
+│   └── dog/
+├── val/
+└── test/
+```
+
+### CCMT-style
+
+```text
+dataset/
+├── Cashew/
+│   ├── train_set/
+│   └── test_set/
+└── Tomato/
+    ├── train_set/
+    └── test_set/
+```
+
+Update [glkanet/configs/dataset.yaml](glkanet/configs/dataset.yaml) to match your dataset path and split names.
+
+## Configuration Files
+
+- [glkanet/configs/Hybird.yaml](glkanet/configs/Hybird.yaml): model architecture
+- [glkanet/configs/dataset.yaml](glkanet/configs/dataset.yaml): dataset path and split configuration
+- [glkanet/configs/train.yaml](glkanet/configs/train.yaml): training hyperparameters, device, and export options
+
+## Evaluation
 
 ```bash
-python -m glkanet export --weights runs/exp1/weights/best_train.pt --model glkanet/configs/shuffle_glkav2.yaml
+python -m glkanet val --cfg glkanet/configs/train.yaml --model glkanet/configs/Hybird.yaml --split test --weights runs/exp1/weights/best_f1.pt
 ```
 
-Đối với TFLite, repo đã có script riêng ở thư mục TFlite. Trên Windows có thể dùng:
+## Export
+
+### Export ONNX
 
 ```bash
-TFlite\setup_and_run.bat --onnx runs\exp1\weights\best_deploy.onnx --out runs\exp1\weights\tflite --input-size 224 --mode all
+python -m glkanet export --weights runs/exp1/weights/best_train.pt --model glkanet/configs/Hybird.yaml
 ```
 
-## 7. Kết quả sau khi chạy
+### Export TFLite from a separate script
 
-Kết quả sẽ được lưu trong thư mục `runs/expX/` gồm:
+For a standalone TFLite export workflow, you can create your own file and call the exporter inside [TFlite](TFlite). A ready-to-edit template is available at [scripts/export_tflite_template.py](scripts/export_tflite_template.py).
 
-- weights: checkpoint và file deploy
-- báo cáo huấn luyện và confusion matrix
-- đồ thị loss/accuracy
+Example:
 
-Ví dụ cấu trúc cơ bản:
+```bash
+python scripts/export_tflite_template.py --onnx runs/exp1/weights/best_deploy.onnx --out runs/exp1/weights/tflite --input-size 224 --mode all
+```
+
+## Outputs
+
+After training, results are written to a folder under [runs](runs), for example:
 
 ```text
 runs/exp1/
 ├── weights/
+│   ├── best_f1.pt
+│   ├── best_loss.pt
+│   ├── best_train.pt
+│   ├── best_deploy.pt
+│   └── best_deploy.onnx
 ├── epoch_reports.txt
 ├── report_val_best_f1.txt
 ├── report_test.txt
 └── training_curves.png
 ```
 
-## 8. Cấu trúc thư mục chính
+## Notes
 
-```text
-Simple_GLKA/
-├── glkanet/              # code chính: model, trainer, exporter
-├── glkanet/configs/      # file YAML cho model/data/train
-├── runs/                 # output training và evaluation
-├── TFlite/               # script export sang TFLite
-├── GLKAnet.py            # entrypoint train nhanh
-└── README.md             # hướng dẫn dùng repo
+- On Windows, if you encounter multiprocessing issues, reduce `num_workers` to `0` in [glkanet/configs/train.yaml](glkanet/configs/train.yaml).
+- For GPU training, keep `device: cuda`.
+- To resume training from a previous checkpoint:
+
+```python
+from glkanet import GLKA
+
+model = GLKA("glkanet/configs/Hybird.yaml")
+model.train("glkanet/configs/train.yaml", resume_ckpt="runs/exp1/last.pt")
 ```
-Nếu bạn muốn dùng repo này cho dataset riêng, chỉ cần sửa 2 file config: dataset.yaml và train.yaml là đã có thể chạy được.
-
 ```

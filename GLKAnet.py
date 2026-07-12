@@ -1,7 +1,7 @@
 from glkanet import GLKA
 
 def main():
-    model = GLKA("glkanet/configs/Hybird.yaml")
+    model = GLKA("glkanet/configs/dualattention_glkaV1.yaml")
 
     print("--- Bắt đầu huấn luyện theo cấu hình từ YAML ---")
     model.train("glkanet/configs/train.yaml")

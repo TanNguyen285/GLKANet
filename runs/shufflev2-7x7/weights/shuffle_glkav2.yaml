@@ -1,32 +1,9 @@
-# ==============================================================================
-# GLKANet NETWORK CONFIGURATION TEMPLATE
-# ==============================================================================
-#
-# SYSTEM ARGUMENTS REFERENCE GUIDE:
-# ------------------------------------------------------------------------------
-# 1. ConvBnRelu: [out_channels, kernel_size, stride, padding, groups, use_gelu]
-# 2. ShuffleGLKABlock: [out_channels, stride, split_ratio, use_glka, glka_K, se_reduction]
-# 3. EfficientBlock: [out_channels, stride, expansion_ratio, use_glka, glka_variant, glka_K, se_reduction, no_residual]
-#
-# PARAMETER TUNING RANGE & CONSTRAINTS (English):
-# ------------------------------------------------------------------------------
-# - out_channels   : [int] Multiples of 8 or 16 preferred (e.g., 32 to 1024) for hardware alignment.
-# - stride        : [int] 1 (keep size) or 2 (downsample by half). Do not use other values.
-# - split_ratio   : [float] Range (0.0, 1.0). Best choice: 0.25, 0.5, or 0.75 based on computing budget.
-# - use_glka      : [bool] true (enable Large Kernel Attention) or false (fallback to standard DW-Conv).
-# - glka_K        : [int] Odd numbers only! Range [3, 21]. Standard: 3, 5, 7, 13, 21. Larger K increases receptive field.
-# - se_reduction  : [int] 0 to disable Squeeze-and-Excitation. >0 represents reduction ratio (e.g., 4, 8, 16).
-# - expansion_ratio: [int] Range [1, 6]. Default is 2. Higher values increase hidden dimensions and params.
-# - glka_variant  : [str] Must be one of: "shuffle" | "sexca" | "casexse"
-# - no_residual   : [bool] true to completely drop shortcut addition (saves memory/params when in_ch != out_ch).
-# ==============================================================================
-
 nc: 22
 
 head:
-  dropout: 0.2         # Range [0.0, 0.5]. Higher prevents overfitting.
-  mid_features: 0      # Set to 0 to disable bottleneck (Bare Head: in -> nc). >0 adds a Linear hidden layer.
-  use_bn: true         # [bool] true highly recommended to normalize features after GAP (+0.5%~1.0% Acc).
+  dropout: 0.2        
+  mid_features: 0     
+  use_bn: true         
 
 # ------------------------------------------------------------------------------
 # BACKBONE ARCHITECTURE
