@@ -15,8 +15,8 @@ backbone:
   - [-1, 1, Dual_Attention_Block, [128, 1, 5]]           # 28, 128
 
   # Stage 3: 28x28 -> 14x14
-  - [-1, 1, Dual_Attention_Block, [256, 2, 7]]           # 28 -> 14, 128 -> 256
-  - [-1, 1, Dual_Attention_Block, [256, 1, 7]]           # 14, 256
+  - [-1, 1, Dual_Attention_Block, [256, 2, 5]]           # 28 -> 14, 128 -> 256
+  - [-1, 1, Dual_Attention_Block, [256, 1, 5]]           # 14, 256
 
   # Stage 4: 14x14 -> 7x7
   - [-1, 1, Dual_Attention_Block, [512, 2, 3]]          # 14 -> 7, 256 -> 512

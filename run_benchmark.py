@@ -18,7 +18,7 @@ from layer_benchmark import (
 # ══════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════
-ROOT = Path(r"C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_conv2d\weights")
+ROOT = Path(r"C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_augument\weights")
 TRAIN_FULL_PT  = ROOT / "best_train_full.pt"    # TorchScript chưa freeze hẳn -> có thể per-layer
 DEPLOY_FULL_PT = ROOT / "best_deploy_full.pt"   # TorchScript freeze/optimize -> chỉ end-to-end
 TRAIN_PT       = ROOT / "best_train.pt"         # checkpoint state_dict -> per-layer chắc ăn

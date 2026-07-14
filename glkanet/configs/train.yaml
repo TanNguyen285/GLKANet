@@ -26,7 +26,7 @@ train:
   epochs:     150
   batch_size: 64
   seed:       42
-  val_ratio:  0.1      # dùng khi không có val: trong dataset.yaml -> tự tách từ train_set
+  val_ratio:  0.2      # dùng khi không có val: trong dataset.yaml -> tự tách từ train_set
   test_ratio: 0         # để 0 vì test_set đã tách vật lý sẵn trên đĩa, không cần loader tự chia nữa
   handle_imbalance: true
   label_smoothing:  0.0

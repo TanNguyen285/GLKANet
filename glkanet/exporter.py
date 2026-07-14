@@ -198,6 +198,8 @@ def _run_tflite_pipeline(
     n_calib:    int = 200,
     mean:       tuple[float, float, float] = DEFAULT_MEAN,
     std:        tuple[float, float, float] = DEFAULT_STD,
+    mixed_precision_int8: bool = False,
+    mixed_precision_keywords: list[str] | None = None,
     verbose:    bool = True,
 ) -> tuple[Path | None, dict]:
   
@@ -223,6 +225,10 @@ def _run_tflite_pipeline(
     if test_dir:
         # Dùng luôn test_dir làm calib_dir vì đã có ảnh thật, khỏi cần tách riêng.
         cmd += ["--calib-dir", test_dir, "--test-dir", test_dir]
+    if mixed_precision_int8:
+        cmd += ["--mixed-int8"]
+        if mixed_precision_keywords:
+            cmd += ["--mixed-int8-keywords", ",".join(mixed_precision_keywords)]
     if class_names:
         cmd += ["--class-names", ",".join(class_names)]
 
@@ -345,6 +351,8 @@ def export_all(
     tflite_project_dir: str | Path = "TFlite",
     tflite_mode:   str = "all",
     n_calib:       int = 200,
+    mixed_precision_int8: bool = False,
+    mixed_precision_keywords: list[str] | None = None,
     mean:          tuple[float, float, float] = DEFAULT_MEAN,
     std:           tuple[float, float, float] = DEFAULT_STD,
     # ── Test torch (process chính) ──────────────────────────
@@ -474,6 +482,8 @@ def export_all(
             n_calib=n_calib,
             mean=mean,
             std=std,
+            mixed_precision_int8=mixed_precision_int8,
+            mixed_precision_keywords=mixed_precision_keywords,
             verbose=verbose,
         )
 

@@ -1,63 +1,10 @@
-"""
-bench_dataset.py — Benchmark ONNX vs TFLite chạy TRÊN TOÀN BỘ test_set thật
-(không dùng dummy/random input), đọc cấu hình từ dataset.yaml (ImageFolder-style).
-
-Đặc điểm:
-    - Đọc dataset.yaml (path + test) để tự tìm thư mục test_set thật.
-    - Quét toàn bộ ảnh trong test_set (cấu trúc ImageFolder: test_set/<class_name>/*.jpg).
-    - Warmup CHÍNH XÁC 100 lần bằng ảnh thật (cycle lại nếu ảnh ít hơn 100) trước khi đo.
-    - Nghỉ đúng 3 giây giữa lúc benchmark xong model này và trước khi bắt đầu model kế tiếp,
-      để nhiệt độ CPU/GPU và bộ nhớ ổn định lại, tránh benchmark model sau bị ăn theo
-      hiệu ứng cache/nhiệt của model trước.
-    - Chạy batch=1 tuần tự cho từng backend để so sánh công bằng theo per-image latency.
-    - Tự tính accuracy luôn (tiện có sẵn label từ tên thư mục con), không tốn thêm công.
-    - Xuất báo cáo JSON đầy đủ + in bảng tổng kết ra console.
-
-BẢN SỬA (multi-thread benchmark): thêm --num-threads-list để benchmark CÙNG 1 model
-lần lượt với nhiều số CPU thread khác nhau (vd "2,4,8") — dùng để đo scaling
-theo số core, đúng nhu cầu so sánh 2 vs 4 vs 8 core trên Raspberry Pi/Jetson.
-Mỗi cấu hình thread sẽ tạo 1 session/interpreter RIÊNG (intra_op_num_threads cho
-ONNX Runtime, num_threads cho TFLite Interpreter), có nghỉ giữa mỗi lần đo.
-
-BẢN SỬA (trước đó): thêm --tflite-dir để tự quét TOÀN BỘ file .tflite trong 1 thư mục (vd
-weights/tflite/ với best_deploy_fp32.tflite, best_deploy_fp16.tflite,
-best_deploy_int8.tflite) và benchmark lần lượt từng file, có nghỉ giữa mỗi model
-— dùng cho pipeline tự động gọi từ exporter.py sau khi train xong.
-
-Chạy (trong venv-tflite vì cần cả onnxruntime lẫn tensorflow/tflite_runtime):
-    pip install onnx onnxruntime numpy pillow pyyaml psutil --break-system-packages
-    # (tensorflow đã có sẵn trong venv-tflite để đọc .tflite)
-
-    # Benchmark 1 file tflite cụ thể, mặc định thread (không control):
-    python bench_dataset.py ^
-        --dataset-yaml "C:\\...\\dataset.yaml" ^
-        --onnx "C:\\...\\best_deploy.onnx" ^
-        --tflite "C:\\...\\best_deploy_fp32.tflite" ^
-        --input-size 224 ^
-        --num-threads-list ""
-
-    # Benchmark cả 3 file trong 1 thư mục, lần lượt với 2/4/8 thread:
-    python bench_dataset.py ^
-        --dataset-yaml "C:\\...\\dataset.yaml" ^
-        --onnx "C:\\...\\best_deploy.onnx" ^
-        --tflite-dir "C:\\...\\weights\\tflite" ^
-        --input-size 224 ^
-        --num-threads-list 2,4,8
-
-    Có thể benchmark chỉ 1 model (bỏ --onnx hoặc --tflite/--tflite-dir tương ứng).
-    Dùng --limit N để chạy thử nhanh trên N ảnh đầu tiên trước khi chạy full test_set.
-
-LƯU Ý khi đọc kết quả nhiều thread: Raspberry Pi 4/5 chỉ có 4 core vật lý — số
-thread > 4 là oversubscription, thường KHÔNG nhanh hơn (có khi chậm hơn do
-context-switch). Model dùng nhiều depthwise conv nhỏ (ít FLOPs/op) thường bão
-hòa scaling sớm hơn model dense-conv lớn.
-"""
 from __future__ import annotations
 
 import argparse
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import threading
@@ -87,55 +34,145 @@ except ImportError:
     print("❌ Cần cài pyyaml: pip install pyyaml --break-system-packages")
     sys.exit(1)
 
-DEFAULT_MEAN = (0.485, 0.456, 0.406)
-DEFAULT_STD  = (0.229, 0.224, 0.225)
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-WARMUP_RUNS = 100          # cố định theo yêu cầu — mọi model đều warmup đúng 100 lần
-PAUSE_BETWEEN_MODELS_S = 3.0  # cố định theo yêu cầu — nghỉ đúng 3 giây giữa 2 model
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ⚙️  CONFIG — SỬA Ở ĐÂY, RỒI CHẠY THẲNG: python benchmark_dataset.py
+#     Không cần truyền CLI flag nào nữa (CLI vẫn còn nhưng optional, để
+#     override nếu muốn — mặc định dùng luôn giá trị trong CONFIG).
+# ══════════════════════════════════════════════════════════════════════════
+
+CONFIG = {
+    # Đường dẫn dataset.yaml (path/train/test theo format CCMT)
+    "dataset_yaml": r"C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\dataset.yaml",
+
+    # Model cần benchmark — để None nếu không muốn chạy loại đó
+    "onnx": r"C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_augument\weights\best_deploy.onnx",
+    "tflite": None,
+    "tflite_dir": r"C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_augument\weights\tflite",
+
+    "input_size": 224,
+    "mean": (0.485, 0.456, 0.406),
+    "std": (0.229, 0.224, 0.225),
+    "onnx_provider": "CPU",       # "CPU" | "CUDA" | "TensorRT"
+    "limit": None,                # chỉ chạy N ảnh đầu (test nhanh), None = chạy hết
+    "num_threads_list": [2, 4, 8],  # để [] hoặc None -> chỉ chạy 1 lần config mặc định
+
+    "out_dir": "./bench_results",
+
+    # % ảnh MỖI class lấy từ test_set để benchmark accuracy/latency
+    "auto_sample_fraction": 0.10,
+    "auto_sample_min_per_class": 5,
+    "auto_sample_seed": 42,
+}
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG", ".bmp", ".webp"}
+WARMUP_RUNS = 100          # cố định — mọi model đều warmup đúng 100 lần
+PAUSE_BETWEEN_MODELS_S = 3.0  # cố định — nghỉ đúng 3 giây giữa 2 model
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Đọc dataset.yaml + quét test_set thật (ImageFolder-style)
+#  Đọc dataset.yaml + quét test_set thật (cấu trúc CCMT 2 tầng: Group/split/class)
 # ══════════════════════════════════════════════════════════════════════════
 
-def load_test_set(dataset_yaml: str) -> tuple[list[str], list[int], list[str]]:
+def _stratified_subsample_paths(
+    raw: list[tuple[str, str]],
+    fraction: float,
+    min_per_class: int = 5,
+    seed: int = 42,
+) -> list[tuple[str, str]]:
+    """Lấy rải đều `fraction` ảnh mỗi class (vd 0.10 = 10%), đảm bảo
+    min_per_class ảnh tối thiểu cho class hiếm. raw = [(path, class_name), ...]."""
+    rng = np.random.default_rng(seed)
+
+    by_class: dict[str, list[str]] = {}
+    for path, cname in raw:
+        by_class.setdefault(cname, []).append(path)
+
+    out: list[tuple[str, str]] = []
+    for cname, paths in by_class.items():
+        paths = list(paths)
+        idx = np.arange(len(paths))
+        rng.shuffle(idx)
+        k = max(min_per_class, int(round(len(paths) * fraction)))
+        k = min(k, len(paths))
+        for i in idx[:k]:
+            out.append((paths[i], cname))
+    return out
+
+
+def load_test_set(
+    dataset_yaml: str,
+    sample_fraction: float | None,
+    min_per_class: int,
+    seed: int,
+) -> tuple[list[str], list[int], list[str]]:
     """Đọc dataset.yaml dạng:
         path: <root>
         train: train_set
         test: test_set
-    rồi quét <root>/<test>/<class_name>/*.ảnh -> trả về (image_paths, labels, class_names).
+    quét <root>/<Group>/<test>/<class_name>/*.ảnh (cấu trúc CCMT 2 tầng),
+    rồi tự động lấy sample_fraction ảnh mỗi class (nếu không None).
 
-    Label được gán theo thứ tự tên thư mục con đã sort (đúng quy ước ImageFolder chuẩn:
-    class index = vị trí trong danh sách tên thư mục con đã sort alphabetically).
-    NẾU model của bạn train với thứ tự class khác (ví dụ đọc từ 1 file classes.txt riêng),
-    accuracy tính ra ở đây có thể SAI dù tốc độ đo vẫn đúng — cần đối chiếu lại thứ tự class
-    thật sự dùng lúc train nếu thấy accuracy bất thường.
+    class_names có dạng "<Group>_<class>" (vd "Cashew_anthracnose"), khớp
+    format lúc train. Label = index trong sorted(class_names) toàn cục.
     """
     cfg = yaml.safe_load(Path(dataset_yaml).read_text(encoding="utf-8"))
     root = Path(cfg["path"])
-    test_dir = root / cfg["test"]
+    split_name = cfg["test"]  # vd "test_set"
 
-    if not test_dir.exists():
-        raise FileNotFoundError(f"Không tìm thấy thư mục test_set: {test_dir}")
+    if not root.exists():
+        raise FileNotFoundError(f"Không tìm thấy root dataset: {root}")
 
-    class_names = sorted([d.name for d in test_dir.iterdir() if d.is_dir()])
-    if not class_names:
+    group_dirs = sorted(d for d in root.iterdir() if d.is_dir())
+    if not group_dirs:
+        raise FileNotFoundError(f"Không có group folder nào (Cashew/Cassava/...) trong: {root}")
+
+    # normalize: bỏ số cuối tên class, vd "anthracnose1" -> "anthracnose"
+    def _norm(name: str) -> str:
+        return re.sub(r'\d+$', '', name).strip()
+
+    raw: list[tuple[str, str]] = []  # (path, full_class_name)
+    class_names_set: set[str] = set()
+    found_any_split = False
+
+    for group_dir in group_dirs:
+        split_dir = group_dir / split_name
+        if not split_dir.exists():
+            continue
+        found_any_split = True
+        group_name = group_dir.name
+        for cd in sorted(d for d in split_dir.iterdir() if d.is_dir()):
+            cls = _norm(cd.name)
+            full_name = f"{group_name}_{cls}"
+            class_names_set.add(full_name)
+            for f in cd.rglob("*"):
+                if f.is_file() and f.suffix in IMG_EXTS:
+                    raw.append((str(f), full_name))
+
+    if not found_any_split:
         raise FileNotFoundError(
-            f"Không tìm thấy thư mục class con nào trong: {test_dir}\n"
-            f"Cấu trúc kỳ vọng: {test_dir}/<class_name>/*.jpg"
+            f"Không tìm thấy thư mục '{split_name}/' trong bất kỳ group nào tại: {root}\n"
+            f"Group tìm thấy: {[d.name for d in group_dirs]}"
         )
+    if not raw:
+        raise FileNotFoundError(f"Không có ảnh nào trong split '{split_name}' tại: {root}")
 
-    image_paths: list[str] = []
-    labels: list[int] = []
-    for idx, cname in enumerate(class_names):
-        cdir = test_dir / cname
-        for f in sorted(cdir.iterdir()):
-            if f.suffix.lower() in IMG_EXTS:
-                image_paths.append(str(f))
-                labels.append(idx)
+    class_names = sorted(class_names_set)
 
-    if not image_paths:
-        raise FileNotFoundError(f"Không tìm thấy ảnh nào trong: {test_dir}")
+    # ── Auto-sample X% mỗi class ──
+    if sample_fraction is not None:
+        n_before = len(raw)
+        raw = _stratified_subsample_paths(
+            raw, fraction=sample_fraction,
+            min_per_class=min_per_class, seed=seed,
+        )
+        print(f"  [auto-sample] {n_before} -> {len(raw)} ảnh "
+              f"(lấy {sample_fraction*100:.0f}% mỗi class, tối thiểu "
+              f"{min_per_class} ảnh/class, seed={seed})")
+
+    cls_to_idx = {c: i for i, c in enumerate(class_names)}
+    image_paths = [p for p, _ in raw]
+    labels = [cls_to_idx[c] for _, c in raw]
 
     return image_paths, labels, class_names
 
@@ -248,7 +285,7 @@ class _MemSampler:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Benchmark ONNX trên full test_set
+#  Benchmark ONNX trên (đã auto-sample) test_set
 # ══════════════════════════════════════════════════════════════════════════
 
 def benchmark_onnx_dataset(
@@ -268,12 +305,10 @@ def benchmark_onnx_dataset(
     if requested not in available:
         return {"error": f"{requested} không có sẵn. Available: {available}"}
 
-    # Control số thread CPU dùng cho intra-op (song song trong 1 op, vd conv
-    # chia nhỏ theo channel) — đây là tham số quyết định "dùng bao nhiêu core".
     sess_options = ort.SessionOptions()
     if num_threads is not None:
         sess_options.intra_op_num_threads = num_threads
-        sess_options.inter_op_num_threads = 1  # tắt song song giữa các op độc lập, tránh cộng dồn ngoài ý muốn
+        sess_options.inter_op_num_threads = 1
 
     try:
         sess = ort.InferenceSession(model_path, sess_options=sess_options, providers=[requested])
@@ -332,7 +367,7 @@ def benchmark_onnx_dataset(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Benchmark TFLite trên full test_set
+#  Benchmark TFLite trên (đã auto-sample) test_set
 # ══════════════════════════════════════════════════════════════════════════
 
 def _get_tflite_interpreter_cls():
@@ -356,8 +391,6 @@ def benchmark_tflite_dataset(
     Interpreter, backend_name = _get_tflite_interpreter_cls()
 
     try:
-        # TFLite Interpreter hỗ trợ sẵn tham số num_threads trong constructor —
-        # quyết định số CPU thread dùng cho các op có kernel đa luồng (XNNPACK).
         kwargs = {"model_path": model_path}
         if num_threads is not None:
             kwargs["num_threads"] = num_threads
@@ -370,7 +403,6 @@ def benchmark_tflite_dataset(
     out_details = interp.get_output_details()[0]
     in_index, out_index = in_details["index"], out_details["index"]
     in_dtype = in_details["dtype"]
-    # TFLite convert qua onnx2tf thường chuyển input sang NHWC — tự phát hiện qua shape input.
     tflite_input_is_nhwc = in_details["shape"][-1] == 3
 
     print(f"  [preprocess] Đang decode + resize {len(image_paths)} ảnh...")
@@ -384,7 +416,6 @@ def benchmark_tflite_dataset(
         if tflite_input_is_nhwc:
             arr = arr.transpose(0, 2, 3, 1)  # NCHW -> NHWC
         if in_dtype != np.float32:
-            # Model đã quantize int8/uint8 — cần scale/zero_point từ quantization params.
             scale, zero_point = in_details.get("quantization", (0.0, 0))
             if scale == 0:
                 skipped += 1
@@ -466,49 +497,31 @@ def print_result(label: str, r: dict) -> None:
         print(f"  ⚠️ CV cao ({r['cv_percent']}%) — máy có thể đang bận tiến trình nền khác lúc đo")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Benchmark ONNX/TFLite trên TOÀN BỘ test_set thật (ImageFolder).")
-    ap.add_argument("--dataset-yaml", required=True, help="Đường dẫn dataset.yaml (path/train/test)")
-    ap.add_argument("--onnx", default=None, help="Đường dẫn model .onnx (bỏ qua nếu không muốn benchmark ONNX)")
-    ap.add_argument("--tflite", default=None, help="Đường dẫn 1 model .tflite (bỏ qua nếu không muốn benchmark TFLite)")
-    ap.add_argument("--tflite-dir", default=None,
-                     help="Thư mục chứa nhiều file .tflite, tự quét và benchmark lần lượt "
-                          "(dùng khi muốn benchmark cả fp32/fp16/int8 trong 1 lệnh). "
-                          "Nếu vừa có --tflite vừa có --tflite-dir thì --tflite-dir ưu tiên.")
-    ap.add_argument("--input-size", type=int, default=224, help="Kích thước ảnh vuông đưa vào model (mặc định 224)")
-    ap.add_argument("--mean", default=",".join(str(x) for x in DEFAULT_MEAN), help="Mean normalize, 3 số cách nhau bởi dấu phẩy")
-    ap.add_argument("--std", default=",".join(str(x) for x in DEFAULT_STD), help="Std normalize, 3 số cách nhau bởi dấu phẩy")
-    ap.add_argument("--onnx-provider", default="CPU", choices=["CPU", "CUDA", "TensorRT"], help="Provider cho ONNX Runtime")
-    ap.add_argument("--limit", type=int, default=None, help="Chỉ chạy N ảnh đầu tiên (test nhanh trước khi chạy full)")
-    ap.add_argument("--num-threads-list", default="2,4,8",
-                     help="Danh sách số CPU thread cần benchmark, cách nhau bởi dấu phẩy "
-                          "(vd '2,4,8'). Mỗi model sẽ được benchmark lại 1 lần cho MỖI số "
-                          "thread trong danh sách (session/interpreter riêng cho mỗi lần), "
-                          "có nghỉ giữa mỗi lần đo. Truyền chuỗi rỗng '' để chỉ chạy 1 lần "
-                          "với cấu hình mặc định (không ép số thread).")
-    ap.add_argument("--out", default="./bench_results", help="Thư mục lưu báo cáo JSON")
-    args = ap.parse_args()
-
-    if not args.onnx and not args.tflite and not args.tflite_dir:
-        print("❌ Cần truyền ít nhất --onnx hoặc --tflite/--tflite-dir (có thể truyền cả hai để so sánh).")
+def run(cfg: dict) -> None:
+    """Chạy full benchmark theo CONFIG. Đây là hàm chính — gọi trực tiếp,
+    không cần CLI."""
+    if not cfg["onnx"] and not cfg["tflite"] and not cfg["tflite_dir"]:
+        print("❌ CONFIG cần ít nhất 'onnx' hoặc 'tflite'/'tflite_dir'.")
         sys.exit(1)
 
-    mean = tuple(float(x) for x in args.mean.split(","))
-    std = tuple(float(x) for x in args.std.split(","))
+    mean = tuple(cfg["mean"])
+    std = tuple(cfg["std"])
 
-    print(f"=== Đọc dataset từ: {args.dataset_yaml} ===")
-    image_paths, labels, class_names = load_test_set(args.dataset_yaml)
-    print(f"  Tìm thấy {len(class_names)} class, tổng {len(image_paths)} ảnh trong test_set.")
+    print(f"=== Đọc dataset từ: {cfg['dataset_yaml']} ===")
+    image_paths, labels, class_names = load_test_set(
+        cfg["dataset_yaml"],
+        sample_fraction=cfg["auto_sample_fraction"],
+        min_per_class=cfg["auto_sample_min_per_class"],
+        seed=cfg["auto_sample_seed"],
+    )
+    print(f"  Tìm thấy {len(class_names)} class, tổng {len(image_paths)} ảnh sau auto-sample.")
 
-    if args.limit:
-        image_paths = image_paths[:args.limit]
-        labels = labels[:args.limit]
-        print(f"  --limit={args.limit} → chỉ chạy {len(image_paths)} ảnh đầu tiên.")
+    if cfg["limit"]:
+        image_paths = image_paths[:cfg["limit"]]
+        labels = labels[:cfg["limit"]]
+        print(f"  limit={cfg['limit']} → chỉ chạy {len(image_paths)} ảnh đầu tiên.")
 
-    if args.num_threads_list.strip():
-        thread_list: list[int | None] = [int(x) for x in args.num_threads_list.split(",")]
-    else:
-        thread_list = [None]
+    thread_list = cfg["num_threads_list"] or [None]
     print(f"  Cấu hình thread sẽ chạy: {thread_list}")
 
     all_results: dict[str, dict] = {}
@@ -517,39 +530,36 @@ def main():
         nt_label = f"{nt}threads" if nt is not None else "default"
         print(f"\n{'='*70}\n  ═══ CẤU HÌNH: {nt_label} ═══\n{'='*70}")
 
-        # ── Benchmark ONNX (nếu có) ──────────────────────────────────
-        if args.onnx:
-            if not Path(args.onnx).exists():
-                print(f"❌ Không tìm thấy file ONNX: {args.onnx}")
+        if cfg["onnx"]:
+            if not Path(cfg["onnx"]).exists():
+                print(f"❌ Không tìm thấy file ONNX: {cfg['onnx']}")
                 sys.exit(1)
-            print(f"\n{'#'*70}\n# BENCHMARK ONNX [{nt_label}]: {args.onnx}\n{'#'*70}")
+            print(f"\n{'#'*70}\n# BENCHMARK ONNX [{nt_label}]: {cfg['onnx']}\n{'#'*70}")
             t_start = time.perf_counter()
-            r = benchmark_onnx_dataset(args.onnx, image_paths, labels, args.input_size, mean, std,
-                                        args.onnx_provider, num_threads=nt)
+            r = benchmark_onnx_dataset(cfg["onnx"], image_paths, labels, cfg["input_size"], mean, std,
+                                        cfg["onnx_provider"], num_threads=nt)
             r["wall_clock_total_s"] = round(time.perf_counter() - t_start, 3)
             key = f"onnx_{nt_label}"
-            all_results[key] = {"model_path": str(Path(args.onnx).resolve()), "result": r}
-            print_result(f"ONNX ({args.onnx_provider}) [{nt_label}]", r)
+            all_results[key] = {"model_path": str(Path(cfg["onnx"]).resolve()), "result": r}
+            print_result(f"ONNX ({cfg['onnx_provider']}) [{nt_label}]", r)
 
-        # ── Xác định danh sách file TFLite cần benchmark: ưu tiên --tflite-dir ──
         tflite_targets: list[Path] = []
-        if args.tflite_dir:
-            tflite_targets = sorted(Path(args.tflite_dir).glob("*.tflite"))
+        if cfg["tflite_dir"]:
+            tflite_targets = sorted(Path(cfg["tflite_dir"]).glob("*.tflite"))
             if not tflite_targets:
-                print(f"❌ Không tìm thấy file .tflite nào trong: {args.tflite_dir}")
+                print(f"❌ Không tìm thấy file .tflite nào trong: {cfg['tflite_dir']}")
                 sys.exit(1)
-        elif args.tflite:
-            p = Path(args.tflite)
+        elif cfg["tflite"]:
+            p = Path(cfg["tflite"])
             if not p.exists():
-                print(f"❌ Không tìm thấy file TFLite: {args.tflite}")
+                print(f"❌ Không tìm thấy file TFLite: {cfg['tflite']}")
                 sys.exit(1)
             tflite_targets = [p]
 
-        if args.onnx and tflite_targets:
+        if cfg["onnx"] and tflite_targets:
             print(f"\n⏸  Nghỉ {PAUSE_BETWEEN_MODELS_S}s giữa ONNX và loạt TFLite để hệ thống ổn định lại...")
             time.sleep(PAUSE_BETWEEN_MODELS_S)
 
-        # ── Benchmark từng file TFLite, có nghỉ giữa mỗi model ────────────
         for i, tflite_path in enumerate(tflite_targets):
             if i > 0:
                 print(f"\n⏸  Nghỉ {PAUSE_BETWEEN_MODELS_S}s trước khi benchmark model tiếp theo...")
@@ -557,18 +567,16 @@ def main():
             key = f"{tflite_path.stem}_{nt_label}"
             print(f"\n{'#'*70}\n# BENCHMARK TFLITE [{key}]: {tflite_path}\n{'#'*70}")
             t_start = time.perf_counter()
-            r = benchmark_tflite_dataset(str(tflite_path), image_paths, labels, args.input_size, mean, std,
+            r = benchmark_tflite_dataset(str(tflite_path), image_paths, labels, cfg["input_size"], mean, std,
                                           num_threads=nt)
             r["wall_clock_total_s"] = round(time.perf_counter() - t_start, 3)
             all_results[key] = {"model_path": str(tflite_path.resolve()), "result": r}
             print_result(f"TFLite [{key}]", r)
 
-        # ── Nghỉ giữa các cấu hình thread khác nhau (trừ lần cuối) ──────────
         if cfg_idx < len(thread_list) - 1:
             print(f"\n⏸  Nghỉ {PAUSE_BETWEEN_MODELS_S}s trước khi đổi sang cấu hình thread tiếp theo...")
             time.sleep(PAUSE_BETWEEN_MODELS_S)
 
-    # ── So sánh nhanh: bảng tổng hợp toàn bộ (model x thread) ─────────
     print(f"\n{'='*70}\n  SO SÁNH TỔNG HỢP (tất cả model x tất cả cấu hình thread)\n{'='*70}")
     print(f"  {'Backend':<30} {'Latency(ms)':>14} {'FPS':>10} {'Acc(%)':>10}")
     print(f"  {'-'*30} {'-'*14} {'-'*10} {'-'*10}")
@@ -579,25 +587,56 @@ def main():
             continue
         print(f"  {name:<30} {r['latency_mean_ms']:>14} {r['throughput_fps']:>10} {r['accuracy']*100:>9.2f}")
 
-    # ── Lưu báo cáo ──
-    Path(args.out).mkdir(parents=True, exist_ok=True)
+    out_dir = Path(cfg["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = Path(args.out) / f"bench_dataset_{ts}.json"
+    out_path = out_dir / f"bench_dataset_{ts}.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({
             "timestamp": datetime.now().isoformat(),
-            "dataset_yaml": str(Path(args.dataset_yaml).resolve()),
+            "dataset_yaml": str(Path(cfg["dataset_yaml"]).resolve()),
             "num_classes": len(class_names),
             "num_images_total": len(image_paths),
-            "input_size": args.input_size,
+            "input_size": cfg["input_size"],
             "mean": mean, "std": std,
             "warmup_runs": WARMUP_RUNS,
             "pause_between_models_s": PAUSE_BETWEEN_MODELS_S,
             "num_threads_list": thread_list,
+            "auto_sample_fraction": cfg["auto_sample_fraction"],
             "results": all_results,
         }, f, ensure_ascii=False, indent=2)
     print(f"\n✅ Đã lưu báo cáo đầy đủ: {out_path}")
 
 
+def _cli_override(cfg: dict) -> dict:
+    """CLI optional — chỉ dùng khi muốn override CONFIG mà không sửa code.
+    Không truyền gì cả -> dùng y nguyên CONFIG ở đầu file."""
+    ap = argparse.ArgumentParser(description="Benchmark ONNX/TFLite (mặc định dùng CONFIG trong file, CLI chỉ để override).")
+    ap.add_argument("--dataset-yaml", default=None)
+    ap.add_argument("--onnx", default=None)
+    ap.add_argument("--tflite", default=None)
+    ap.add_argument("--tflite-dir", default=None)
+    ap.add_argument("--input-size", type=int, default=None)
+    ap.add_argument("--sample-fraction", type=float, default=None,
+                     help="Override auto_sample_fraction (vd 0.2 = 20%% mỗi class)")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--num-threads-list", default=None, help="vd '2,4,8'")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+
+    if args.dataset_yaml: cfg["dataset_yaml"] = args.dataset_yaml
+    if args.onnx: cfg["onnx"] = args.onnx
+    if args.tflite: cfg["tflite"] = args.tflite
+    if args.tflite_dir: cfg["tflite_dir"] = args.tflite_dir
+    if args.input_size: cfg["input_size"] = args.input_size
+    if args.sample_fraction is not None: cfg["auto_sample_fraction"] = args.sample_fraction
+    if args.limit is not None: cfg["limit"] = args.limit
+    if args.num_threads_list is not None:
+        cfg["num_threads_list"] = [int(x) for x in args.num_threads_list.split(",")] if args.num_threads_list.strip() else []
+    if args.out: cfg["out_dir"] = args.out
+    return cfg
+
+
 if __name__ == "__main__":
-    main()
+    cfg = _cli_override(dict(CONFIG))
+    run(cfg)

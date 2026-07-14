@@ -550,8 +550,8 @@ def get_data_loaders(
 ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], List[str]]:
     dcfg = DataConfig(data_yaml)
 
-    val_ratio   = train_cfg.get("val_ratio",  0.15)
-    test_ratio  = train_cfg.get("test_ratio", 0.15)
+    val_ratio   = train_cfg.get("val_ratio",  0.2)
+    test_ratio  = train_cfg.get("test_ratio", 0.1)
     seed        = train_cfg.get("seed",       42)
     imbalance   = train_cfg.get("handle_imbalance", False)
     img_size    = train_cfg.get("img_size", 224)

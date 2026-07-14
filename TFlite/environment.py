@@ -4,7 +4,8 @@
 
 Cách dùng (CLI, để trainer.py/exporter.py gọi tự động qua subprocess):
     python environment.py --onnx path/to/best_deploy.onnx --out path/to/tflite \
-        --input-size 224 --mode all --calib-dir path/to/test --test-dir path/to/test \
+        --input-size 224 --mode all --calib-dir path/to/dataset --test-dir path/to/dataset \
+        --calib-split-name train_set --test-split-name test_set \
         --class-names c0,c1,c2 --mean 0.485,0.456,0.406 --std 0.229,0.224,0.225
 
 File này cần nằm CÙNG THƯ MỤC với:
@@ -34,16 +35,38 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--input-size", type=int, default=224)
     ap.add_argument("--mode", default="all", choices=["fp32", "fp16", "int8", "all"])
     ap.add_argument("--calib-dir", default=None)
-    ap.add_argument("--n-calib", type=int, default=200)
+    # FIX: n_calib giờ là TỈ LỆ (fraction) ảnh mỗi class dùng để calibrate
+    # int8, KHÔNG còn là tổng số ảnh cố định (200) như bản cũ. Khớp với
+    # onnx_to_tflite.py đã sửa (_collect_calib_images lấy đều %/class).
+    # 0.10 = 10% ảnh mỗi class. Tăng lên 0.2 nếu 10% chưa đủ ổn định accuracy.
+    ap.add_argument("--n-calib", type=float, default=0.20,)
     ap.add_argument("--test-dir", default=None)
     ap.add_argument("--class-names", default=None)
     ap.add_argument("--eval-out", default=None)
+    # FIX: thiếu 2 tham số này ở bản cũ khiến calib_split_name/test_split_name
+    # bị rớt mất khi environment.py forward xuống onnx_to_tflite.py — dù
+    # re_export.py có set CALIB_SPLIT_NAME="train_set" thì cũng không tới
+    # được đây, convert() sẽ âm thầm dùng mặc định "test_set" bên trong.
+    ap.add_argument("--calib-split-name", default="test_set",
+                     help="Split dùng để lấy ảnh calib int8 (CCMT 2 tầng), "
+                          "vd 'train_set' hoặc 'test_set'. Bỏ qua nếu calib-dir "
+                          "là ImageFolder phẳng.")
+    ap.add_argument("--test-split-name", default="test_set",
+                     help="Split dùng để eval accuracy sau convert (CCMT 2 tầng). "
+                          "Bỏ qua nếu test-dir là ImageFolder phẳng.")
+    ap.add_argument("--sample-fraction", type=float, default=0.10,
+                     help="Tỉ lệ ảnh MỖI class dùng để eval accuracy sau convert "
+                          "(mặc định 0.10 = 10%%).")
     ap.add_argument("--mean", default=None,
                      help="3 số cách nhau dấu phẩy, VD: 0.485,0.456,0.406. "
                           "Mặc định ImageNet nếu bỏ trống.")
     ap.add_argument("--std", default=None,
                      help="3 số cách nhau dấu phẩy, VD: 0.229,0.224,0.225. "
                           "Mặc định ImageNet nếu bỏ trống.")
+    ap.add_argument("--mixed-int8", action="store_true",
+                     help="Xuất thêm bản int8 denylist MaxPool2D (giữ float32 riêng).")
+    ap.add_argument("--mixed-int8-keywords", default="MaxPool2D",
+                     help="Từ khóa denylist, cách nhau dấu phẩy.")
     return ap.parse_args()
 
 
@@ -103,6 +126,8 @@ def _run_conversion(args: argparse.Namespace) -> None:
     std  = _parse_triplet(args.std, DEFAULT_STD)
 
     print("=== Bắt đầu convert ONNX -> TFLite ===")
+    print(f"    calib: {args.n_calib*100:.0f}% ảnh/class, split='{args.calib_split_name}'")
+
     convert(
         onnx_path=args.onnx,
         out_dir=args.out,
@@ -110,14 +135,19 @@ def _run_conversion(args: argparse.Namespace) -> None:
         mode=args.mode,
         calib_dir=args.calib_dir,
         n_calib=args.n_calib,
+        calib_split_name=args.calib_split_name,
         mean=mean,
         std=std,
+        mixed_precision_int8=args.mixed_int8,
+        mixed_precision_keywords=[k.strip() for k in args.mixed_int8_keywords.split(",") if k.strip()],
+    
     )
 
     if args.test_dir:
         class_names = args.class_names.split(",") if args.class_names else None
         eval_out = args.eval_out or str(Path(args.out) / "backend_eval_results.json")
         print("=== Bắt đầu eval accuracy ONNX + TFLite trên test set thật ===")
+        print(f"    eval: {args.sample_fraction*100:.0f}% ảnh/class, split='{args.test_split_name}'")
         evaluate_backends(
             onnx_path=args.onnx,
             tflite_dir=args.out,
@@ -127,6 +157,9 @@ def _run_conversion(args: argparse.Namespace) -> None:
             eval_out_json=eval_out,
             mean=mean,
             std=std,
+            split_name=args.test_split_name,          # FIX: forward xuống, trước đây bị rớt
+            max_samples=None,
+            sample_fraction=args.sample_fraction,      # FIX: dùng %/class thay vì mặc định max_samples=1000
         )
 
 
