@@ -1,0 +1,23 @@
+nc: 22
+
+head:
+  dropout: 0.2
+
+backbone:
+  - [-1, 1, ConvBnRelu,     [32, 3, 2, 1, 1]]           # stem: 224 -> 112, in=3
+
+  # Stage 1: 112x112 -> 56x56
+  - [-1, 1, GLKA_Shuffle, [64, 3, 2, "se"]]             # 112 -> 56, 
+  - [-1, 1, GLKA_Shuffle, [64, 3, 1, "se"]]             # 56, stride=1 
+
+  # Stage 2: 56x56 -> 28x28
+  - [-1, 1, GLKA_Shuffle, [128, 3, 2, "se"]]            # 56 -> 28
+  - [-1, 1, GLKA_Shuffle, [128, 3, 1, "se"]]            # 28, stride=1
+
+  # Stage 3: 28x28 -> 14x14
+  - [-1, 1, GLKA_Shuffle, [256, 3, 2, "se"]]           # 28 -> 14
+  - [-1, 1, GLKA_Shuffle, [256, 3, 1, "se"]]           # 14, stride=
+
+  # Stage 4: 14x14 -> 7x7
+  - [-1, 1, GLKA_Shuffle, [512, 3, 2, "se"]]            # 14 -> 7
+  - [-1, 1, GLKA_Shuffle, [512, 3, 1, "se"]]            # 7, stride=1

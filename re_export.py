@@ -7,7 +7,7 @@ from glkanet import GLKA
 from glkanet.exporter import export_all
 
 # ── Sửa đúng đường dẫn của bạn ───────────────────────────────
-ROOT        = Path(r"C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_ccmt_augument")
+ROOT        = Path(r"C:\Users\ThisPC\Documents\GitHub\Simple_GLKA\runs\dual_residual")
 CKPT_PATH   = ROOT / "best_f1.pt"                              # checkpoint gốc từ Trainer
 CFG_YAML    = ROOT / "weights" / "dualattention_glkaV1.yaml"   # nếu đã bị xoá, trỏ về file yaml gốc lúc train
 NUM_CLASSES = 22   # CCMT: 22 class
